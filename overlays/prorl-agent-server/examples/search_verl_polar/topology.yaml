@@ -1,0 +1,21 @@
+rollout:
+  host: 127.0.0.1
+  port: 18080
+  public_url: http://127.0.0.1:18080
+  save_dir: ./rollout_results/search_verl_polar
+
+gateway:
+  heartbeat_interval_seconds: 30
+  nodes:
+    - id: search-node-01
+      host: 127.0.0.1
+      port: 18100
+      public_url: http://127.0.0.1:18100
+      max_init_workers: 64
+      max_run_workers: 128
+      max_postrun_workers: 64
+      model_served: ""
+      sglang:
+        # Render this to the VERL policy rollout/router OpenAI-compatible URL.
+        # Do NOT point this at retrieval_server_sglang_summarize.py's summary SGLang.
+        base_url: http://127.0.0.1:30000/v1

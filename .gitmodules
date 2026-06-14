@@ -1,0 +1,6 @@
+[submodule "submodules/prorl-agent-server"]
+	path = submodules/prorl-agent-server
+	url = https://github.com/NVIDIA-NeMo/ProRL-Agent-Server.git
+[submodule "submodules/verl"]
+	path = submodules/verl
+	url = https://github.com/verl-project/verl.git

@@ -1,0 +1,168 @@
+--- a/verl/trainer/ppo/ray_trainer.py
++++ b/verl/trainer/ppo/ray_trainer.py
+@@ -19,10 +19,13 @@
+ import json
++import os
+ import uuid
++from collections import defaultdict
+ from copy import deepcopy
+ from pprint import pprint
+-from typing import Optional
++from typing import Any, Optional
+
++import numpy as np
+ import torch
+ from omegaconf import OmegaConf, open_dict
+ from torch.utils.data import Dataset, Sampler
+
+@@ -549,6 +552,6 @@
+                 batch_reward = self._compute_reward_colocate(test_output_gen_batch_padded)
+                 test_output_gen_batch_padded = test_output_gen_batch_padded.union(batch_reward)
+                 # wake up rollout model
+                 # replace with wake_up method once supported
+-                self.checkpoint_manager.update_weights(self.global_steps)
++                _verl_polar_update_weights_with_hooks(self, self.global_steps)
+
+@@ -1240,5 +1243,5 @@
+
+         # load checkpoint and update weights before doing anything
+         self._load_checkpoint()
+-        self.checkpoint_manager.update_weights(self.global_steps)
++        _verl_polar_update_weights_with_hooks(self, self.global_steps)
+
+@@ -1316,7 +1319,17 @@
+
+                         timing_raw.update(gen_batch_output.meta_info["timing"])
+                         gen_batch_output.meta_info.pop("timing", None)
++                        polar_rollout_metrics = _verl_polar_reduce_rollout_metrics(gen_batch_output)
++                        _verl_polar_debug_rollout_metrics(gen_batch_output, polar_rollout_metrics)
++                        metrics.update(polar_rollout_metrics)
++
++                        if gen_batch_output.meta_info.get("polar_already_aligned_batch", False):
++                            batch = gen_batch_output
++                            gen_batch_output = None
++                        elif gen_batch_output.meta_info.get("polar_dynamic_history", False):
++                            batch = _verl_polar_expand_batch_by_source_uid(batch, gen_batch_output)
++                            gen_batch_output = None
+
+                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
+                         with marked_timer("gen_max", timing_raw, color="purple"):
+
+@@ -1346,9 +1357,10 @@
+
+                             del rm_scores, gen_baseline_batch, gen_baseline_output
+                     # repeat to align with repeated responses in rollout
+-                    batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+-                    batch = batch.union(gen_batch_output)
++                    if gen_batch_output is not None:
++                        batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
++                        batch = batch.union(gen_batch_output)
+
+                     if "response_mask" not in batch.batch.keys():
+                         batch.batch["response_mask"] = compute_response_mask(batch)
+
+@@ -1521,8 +1533,8 @@
+
+                         # update weights from trainer to rollout
+                         with marked_timer("update_weights", timing_raw, color="red"):
+-                            self.checkpoint_manager.update_weights(self.global_steps)
++                            _verl_polar_update_weights_with_hooks(self, self.global_steps)
+
+                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
+                         metrics.update(actor_output_metrics)
+
+@@ -1606,3 +1618,94 @@
+                 if hasattr(self.train_dataset, "on_batch_end"):
+                     # The dataset may be changed after each training batch
+                     self.train_dataset.on_batch_end(batch=batch)
++
++
++def _verl_polar_reduce_rollout_metrics(gen_batch_output):
++    """Extract optional Polar rollout metrics from AgentLoopManager output."""
++    meta_info = getattr(gen_batch_output, "meta_info", {}) or {}
++    metrics = meta_info.get("metrics")
++    if not metrics:
++        metrics = meta_info.get("polar_metrics") or meta_info.get("polar_scheduler_stats")
++    if not metrics:
++        return {}
++    if isinstance(metrics, list):
++        merged = defaultdict(list)
++        for item in metrics:
++            if not isinstance(item, dict):
++                continue
++            for key, value in item.items():
++                merged[key].append(value)
++        return reduce_metrics(merged) if merged else {}
++    if isinstance(metrics, dict):
++        if any(isinstance(value, (list, tuple, np.ndarray)) for value in metrics.values()):
++            return reduce_metrics(dict(metrics))
++        return dict(metrics)
++    return {}
++
++
++def _verl_polar_debug_rollout_metrics(gen_batch_output, reduced_metrics):
++    """Optional one-line diagnostics for Polar rollout metric plumbing."""
++    if str(os.environ.get("POLAR_TRAINER_METRICS_DEBUG", "0")).strip().lower() not in {"1", "true", "yes", "on"}:
++        return
++    meta_info = getattr(gen_batch_output, "meta_info", {}) or {}
++    polar_keys = sorted(key for key in reduced_metrics if str(key).startswith("polar/"))
++    print(
++        "POLAR_TRAINER_METRICS_DEBUG "
++        f"meta_keys={sorted(meta_info.keys())} "
++        f"raw_metrics_type={type(meta_info.get('metrics')).__name__} "
++        f"polar_metrics_type={type(meta_info.get('polar_metrics')).__name__} "
++        f"reduced_count={len(reduced_metrics)} "
++        f"polar_key_count={len(polar_keys)} "
++        f"polar_keys={polar_keys[:80]}",
++        flush=True,
++    )
++
++
++def _verl_polar_update_weights_with_hooks(trainer, global_steps):
++    manager = getattr(trainer, "async_rollout_manager", None)
++    if hasattr(manager, "prepare_policy_update"):
++        manager.prepare_policy_update(global_steps)
++    try:
++        result = trainer.checkpoint_manager.update_weights(global_steps)
++    except BaseException:
++        if hasattr(manager, "abort_policy_update"):
++            manager.abort_policy_update(global_steps)
++        elif hasattr(manager, "finish_policy_update"):
++            manager.finish_policy_update(global_steps)
++        raise
++    if hasattr(manager, "update_policy_version"):
++        manager.update_policy_version(global_steps)
++    if hasattr(manager, "finish_policy_update"):
++        manager.finish_policy_update(global_steps)
++    return result
++
++
++def _verl_polar_expand_batch_by_source_uid(batch, gen_batch_output):
++    import numpy as np
++    import torch
++    from verl.protocol import DataProto
++
++    source_uids = gen_batch_output.non_tensor_batch.get("source_uid")
++    if source_uids is None:
++        source_uids = gen_batch_output.non_tensor_batch.get("uid")
++    if source_uids is None:
++        raise ValueError("Polar dynamic-history rollout output requires non_tensor_batch['source_uid'] or ['uid']")
++
++    base_uids = batch.non_tensor_batch.get("uid")
++    if base_uids is None:
++        raise ValueError("Polar dynamic-history alignment requires original batch non_tensor_batch['uid']")
++    uid_to_index = {str(uid): i for i, uid in enumerate(base_uids)}
++    indices = []
++    for uid in source_uids:
++        key = str(uid)
++        if key not in uid_to_index:
++            raise ValueError(f"Polar dynamic-history source_uid {key!r} not found in original batch uid")
++        indices.append(uid_to_index[key])
++
++    device = batch.batch.device if batch.batch is not None else None
++    torch_indices = torch.tensor(indices, dtype=torch.long, device=device)
++    np_indices = np.asarray(indices, dtype=np.int64)
++    expanded_batch = batch.batch[torch_indices] if batch.batch is not None else None
++    expanded_non_tensors = {key: value[np_indices] for key, value in batch.non_tensor_batch.items()}
++    expanded = DataProto(batch=expanded_batch, non_tensor_batch=expanded_non_tensors, meta_info=batch.meta_info.copy())
++    return expanded.union(gen_batch_output)
