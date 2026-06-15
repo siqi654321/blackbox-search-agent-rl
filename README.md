@@ -1,55 +1,431 @@
 # blackbox-search-agent-rl
 
 `blackbox-search-agent-rl` is a research repo for RL training of **black-box search
-agents**.  The goal is to let verl train on trajectories produced by any
-`search-agent-harness` instead of hard-coding one particular agent loop inside the
-trainer.  This checkout currently ports the verl standalone SearchR1 flow into a
-Polar-backed, harness-driven architecture while keeping verl and ProRL-Agent-Server
-pinned as reproducible submodules.
+agents**.  The goal is to let verl train on trajectories produced by an external
+`search-agent-harness`, instead of hard-coding one particular agent loop inside
+the trainer.
 
-## Pinned upstreams
+The current checkpoint of this repo ports the verl standalone SearchR1 flow into
+a **Polar + search-agent-harness + verl bridge** architecture.  SearchR1 is the
+first harness; the longer-term goal is to support arbitrary search-agent harnesses
+that call an OpenAI-compatible endpoint and return structured traces/rewards.
+
+## Repository layout
+
+```text
+blackbox-search-agent-rl/
+├── .gitmodules
+├── README.md
+├── scripts/
+│   └── apply_prorl_overlay.sh              # copy this repo's overlay into ProRL
+├── overlays/
+│   └── prorl-agent-server/                 # repo-owned modifications
+│       ├── examples/search_verl_polar/     # launch/train scripts for this recipe
+│       ├── scripts/patch/                  # patch applied to pinned verl
+│       └── src/verl_polar_bridge/          # harness -> verl DataProto bridge
+└── submodules/
+    ├── prorl-agent-server/                 # pinned ProRL-Agent-Server checkout
+    └── verl/                               # pinned verl checkout
+```
+
+Pinned upstreams:
 
 - `submodules/prorl-agent-server`: `NVIDIA-NeMo/ProRL-Agent-Server` at
   `ce92702f65c1ba454ce16b341db4ae9463156719`
 - `submodules/verl`: `verl-project/verl` at
   `6dc2d2301e046006001dfdfbfb5f4666a1cf4ad1`
 
-Initialize them with:
+The overlay is not used in-place.  It must first be copied into the ProRL
+submodule.  After that, all training commands are run from:
 
-```bash
-git submodule update --init --recursive
+```text
+submodules/prorl-agent-server
 ```
 
-Local changes live in `overlays/prorl-agent-server/` and can be applied with:
+From that directory, the pinned verl checkout is the sibling path:
+
+```text
+../verl
+```
+
+There is no nested `open_verl` checkout in this repo.
+
+---
+
+## Step-by-step runbook
+
+This section is the operational path from a fresh clone to launching the current
+SearchR1 true-long style run.  Commands are written relative to the actual repo
+layout above.
+
+The repo does **not** ship model weights, train/val parquet files, retrieval
+indexes, or a search corpus.  Replace every `/path/to/...` placeholder with your
+own assets.
+
+### 0. Clone and initialize submodules
+
+```bash
+git clone --recurse-submodules https://github.com/siqi654321/blackbox-search-agent-rl.git
+cd blackbox-search-agent-rl
+
+# Safe to rerun; required if the clone was not recursive.
+git submodule update --init --recursive
+
+git submodule status
+```
+
+Expected directories after this step:
+
+```text
+submodules/prorl-agent-server
+submodules/verl
+```
+
+### 1. Apply this repo's overlay to ProRL-Agent-Server
+
+From the repo root:
 
 ```bash
 scripts/apply_prorl_overlay.sh
 ```
 
-## Why this architecture
+This copies:
 
-The original verl standalone SearchR1 setup couples four concerns in one path:
-VERL rollout scheduling, SearchR1 prompt/tool logic, model serving, and conversion
-back to `DataProto`.  That is useful for one recipe, but it makes it hard to swap
-in a different black-box search harness because every harness has different tool
-state, callback behavior, request fanout, and intermediate prompt construction.
+```text
+overlays/prorl-agent-server/*
+```
 
-This repo separates those concerns:
+into:
 
-1. **verl remains the RL optimizer**: PPO/GRPO, weight update, logprob recompute,
-   and checkpointing stay in verl.
-2. **Polar is the rollout/control plane**: it accepts tasks, runs async sessions,
-   routes model calls, and records completion traces.
-3. **`search-agent-harness` is the replaceable policy environment**: SearchR1 is
-   just the first harness.  A future harness only needs to drive the gateway and
-   return structured traces/rewards.
-4. **The bridge turns arbitrary harness traces into verl rows**: it reconstructs
-   token-level prompts/responses, masks non-trainable interstitial tokens, and
-   emits fixed `DataProto` batches for verl.
+```text
+submodules/prorl-agent-server/*
+```
 
-That boundary is what makes “any search-agent-harness” practical: a harness can be
-implemented as a black box that talks to an OpenAI-compatible endpoint and tools,
-while the bridge handles the trainer-specific details once.
+After applying the overlay, these files should exist:
+
+```bash
+test -f submodules/prorl-agent-server/examples/search_verl_polar/launch_polar_long.sh
+test -f submodules/prorl-agent-server/examples/search_verl_polar/train_polar_long.sh
+test -f submodules/prorl-agent-server/scripts/patch/patch_verl.sh
+test -d submodules/prorl-agent-server/src/verl_polar_bridge
+```
+
+### 2. Enter the applied ProRL checkout
+
+Most scripts below assume this working directory:
+
+```bash
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+PRO_RL_ROOT="$REPO_ROOT/submodules/prorl-agent-server"
+VERL_ROOT="$REPO_ROOT/submodules/verl"
+
+cd "$PRO_RL_ROOT"
+```
+
+Use absolute `VERL_ROOT` in environment variables to avoid ambiguity:
+
+```bash
+export VERL_ROOT="$VERL_ROOT"
+```
+
+### 3. Install runtime dependencies
+
+Use an environment that can already run verl + SGLang training.  The launcher can
+install the minimal Polar-side extras with `INSTALL_DEPS=1`, but a fresh machine
+still needs the normal CUDA/PyTorch/verl/SGLang stack.
+
+A typical setup is:
+
+```bash
+# From submodules/prorl-agent-server
+python3 -m pip install -e .
+python3 -m pip install -e "$VERL_ROOT"
+python3 -m pip install faiss-gpu-cu12==1.8.0 fastapi uvicorn numpy==1.26.4
+```
+
+If your cluster image already has these packages, you can skip installation during
+launch with:
+
+```bash
+export INSTALL_DEPS=0
+```
+
+### 4. Patch the pinned verl checkout
+
+There are two patch layers:
+
+1. **Required verl trainer patch**: enables Polar dynamic-history/fanout rows,
+   rollout metrics, `source_uid` alignment, and weight-update hooks.
+2. **Optional SearchR1 baseline overrides**: copies external SearchR1-compatible
+   tool/reward files into the verl checkout for exact standalone comparison.
+
+The required patch can be applied explicitly:
+
+```bash
+# From submodules/prorl-agent-server
+scripts/patch/patch_verl.sh "$VERL_ROOT"
+```
+
+The launcher also runs this automatically when:
+
+```bash
+APPLY_VERL_PATCH=1
+```
+
+To verify the required patch landed:
+
+```bash
+grep -n "_verl_polar_prepare_fanout_training_batch" \
+  "$VERL_ROOT/verl/trainer/ppo/ray_trainer.py"
+```
+
+For the optional SearchR1 baseline copy step:
+
+- If you have external baseline files, set the `BASELINE_*_SRC` variables and
+  keep `APPLY_SEARCH_BASELINE_PATCHES=1`.
+- If you want to use the SearchR1-like files already present in the pinned verl
+  checkout, set:
+
+```bash
+export APPLY_SEARCH_BASELINE_PATCHES=0
+```
+
+The required `patch_verl.sh` step is independent of these optional baseline file
+copies.
+
+### 5. Choose retrieval setup
+
+The harness needs a retrieval HTTP endpoint.  Pick one of the following two modes.
+
+#### Option A: use the retrieval server shipped in the pinned verl checkout
+
+This is the repo-local path.  It does **not** require an external summarizing
+retrieval script.  The pinned verl retriever script hard-codes port `8000`, so
+this option is best for a simple single-retriever setup.
+
+Start the retriever manually:
+
+```bash
+# Still from submodules/prorl-agent-server
+mkdir -p logs/manual_services
+
+CUDA_VISIBLE_DEVICES=0 nohup python3 \
+  "$VERL_ROOT/examples/sglang_multiturn/search_r1_like/local_dense_retriever/retrieval_server.py" \
+  --index_path /path/to/retrieval/index.faiss \
+  --corpus_path /path/to/retrieval/corpus.jsonl \
+  --retriever_name e5 \
+  --retriever_model /path/to/retriever/model \
+  --faiss_gpu \
+  > logs/manual_services/retrieval.out 2>&1 &
+```
+
+That server listens on `http://127.0.0.1:8000/retrieve`, so launch training with:
+
+```bash
+export START_SUMMARY_SGLANG=0
+export START_RETRIEVAL_SERVER=0
+export SEARCH_RETRIEVAL_URL=http://127.0.0.1:8000/retrieve
+export SEARCH_RETRIEVAL_PATH=retrieve
+```
+
+#### Option B: use an external summarizing retrieval server
+
+The one-shot launcher can start a summarizing retrieval stack, but that script is
+not included in this repo.  Use this mode only if you have a compatible script
+that accepts the arguments used by `launch_polar_long.sh`, including:
+
+```text
+--index_path
+--corpus_path
+--faiss_gpu
+--retriever_name
+--retriever_model
+--sglang_base_url
+--sglang_model
+--host
+--port
+```
+
+Then set:
+
+```bash
+export START_SUMMARY_SGLANG=1
+export START_RETRIEVAL_SERVER=1
+export SUMMARY_MODEL_PATH=/path/to/summary/model
+export RETRIEVAL_SERVER_SCRIPT=/path/to/retrieval_server_sglang_summarize.py
+export RETRIEVAL_INDEX_PATH=/path/to/retrieval/index.faiss
+export RETRIEVAL_CORPUS_PATH=/path/to/retrieval/corpus.jsonl
+export RETRIEVER_MODEL_PATH=/path/to/retriever/model
+export SEARCH_RETRIEVAL_URL=http://127.0.0.1:1249/retrieve_summarize_compat
+```
+
+### 6. Prepare model, data, and config variables
+
+The current scripts are designed to run from `submodules/prorl-agent-server`.
+The following template uses the config and tool config from the pinned verl
+submodule, and writes logs/checkpoints under the applied ProRL checkout.
+
+```bash
+# From submodules/prorl-agent-server
+export CONFIG_PATH="$VERL_ROOT/examples/sglang_multiturn/config"
+export CONFIG_NAME=search_multiturn_grpo
+export TOOL_CONFIG="$VERL_ROOT/examples/sglang_multiturn/config/tool_config/search_tool_config.yaml"
+export POLAR_SEARCH_TOOL_CONFIG_PATH="$TOOL_CONFIG"
+export STANDALONE_TOOL_CONFIG_PATH="$TOOL_CONFIG"
+
+export MODEL_PATH=/path/to/policy/model
+# Raw SearchR1-like parquet/jsonl.  The launcher can normalize it into LOG_DIR.
+export RAW_TRAIN_DATA=/path/to/train.parquet
+export PREPARE_LONG_DATA=1
+
+# If you already prepared data, use these instead:
+# export PREPARE_LONG_DATA=0
+# export TRAIN_DATA=/path/to/prepared_train.parquet
+# export VAL_DATA=/path/to/prepared_val.parquet
+
+export LOG_DIR="$PRO_RL_ROOT/logs/search_verl_polar_true_long_$(date +%Y%m%d_%H%M%S)"
+mkdir -p "$LOG_DIR"
+```
+
+`examples/search_verl_polar/prepare_data.py` is schema-tolerant and looks for
+common prompt/answer columns such as `raw_prompt`, `prompt`, `question`, `input`,
+`answer`, `ground_truth`, `target`, and `label`.  If your dataset uses different
+columns, run `prepare_data.py` yourself with `--prompt-key` / `--answer-key` and
+then launch with `PREPARE_LONG_DATA=0`.
+
+### 7. Launch current true-long training
+
+This is the minimal launch command that matches the repository layout.  It assumes
+you already completed steps 0-6 and are still in `submodules/prorl-agent-server`.
+
+```bash
+export VERL_ROOT="$VERL_ROOT"
+export INSTALL_DEPS=${INSTALL_DEPS:-0}
+export APPLY_VERL_PATCH=1
+export APPLY_SEARCH_BASELINE_PATCHES=${APPLY_SEARCH_BASELINE_PATCHES:-0}
+
+export START_POLAR_SERVICES=1
+export RESTART_POLAR_SERVICES=1
+export RESTART_POLAR_GATEWAY=1
+export RESTART_POLAR_ROLLOUT=1
+
+# If using retrieval Option A, keep these disabled because the retriever was
+# started manually.  If using Option B, override them as described above.
+export START_SUMMARY_SGLANG=${START_SUMMARY_SGLANG:-0}
+export START_RETRIEVAL_SERVER=${START_RETRIEVAL_SERVER:-0}
+
+export SUMMARY_SGLANG_CUDA_VISIBLE_DEVICES=${SUMMARY_SGLANG_CUDA_VISIBLE_DEVICES:-0}
+export RETRIEVAL_CUDA_VISIBLE_DEVICES=${RETRIEVAL_CUDA_VISIBLE_DEVICES:-0}
+export TRAIN_CUDA_VISIBLE_DEVICES=${TRAIN_CUDA_VISIBLE_DEVICES:-0,1,2,3}
+export CUDA_VISIBLE_DEVICES="$TRAIN_CUDA_VISIBLE_DEVICES"
+
+export POLAR_N_GPUS_PER_NODE=4
+export POLAR_ROLLOUT_TP_SIZE=1
+export POLAR_ROLLOUT_DP_SIZE=1
+export POLAR_TRAIN_BATCH_SIZE=128
+export POLAR_VAL_BATCH_SIZE=256
+export POLAR_PPO_MINI_BATCH_SIZE=32
+export POLAR_PPO_MICRO_BATCH_SIZE_PER_GPU=1
+export POLAR_AGENT_NUM_WORKERS=128
+export POLAR_ROLLOUT_N=8
+export POLAR_TOTAL_EPOCHS=20
+export POLAR_TOTAL_TRAINING_STEPS=null
+
+export POLAR_MAX_PROMPT_LENGTH=4096
+export POLAR_MAX_RESPONSE_LENGTH=35000
+export POLAR_ROLLOUT_MAX_MODEL_LEN=40000
+export SEARCH_MAX_MODEL_LEN=40000
+export SEARCH_MAX_TURNS=100
+export SEARCH_MAX_TOKENS=35000
+export SEARCH_MAX_TOOL_RESPONSE_LENGTH=2048
+export SEARCH_TOOL_RESPONSE_TRUNCATE_SIDE=middle
+
+export POLAR_ROLLOUT_TEMPERATURE=1.0
+export POLAR_ROLLOUT_TOP_P=1.0
+export POLAR_ROLLOUT_TOP_K=-1
+export POLAR_ROLLOUT_REPETITION_PENALTY=1.0
+export POLAR_ROLLOUT_DO_SAMPLE=true
+export SEARCH_TEMPERATURE=1.0
+export SEARCH_TOP_P=1.0
+export SEARCH_TOP_K=-1
+export SEARCH_REPETITION_PENALTY=1.0
+export SEARCH_DO_SAMPLE=true
+
+export POLAR_FANOUT_TRAINING=1
+export POLAR_MAX_ASYNC_LEVEL=2
+export POLAR_MAX_CONCURRENCY=256
+export POLAR_MAX_SESSION_CONCURRENCY=2048
+export POLAR_REQUEST_TIMEOUT=3600
+export POLAR_SGLANG_GENERATE_TIMEOUT=3600
+export POLAR_OVERFLOW_POLICY=verl_truncate
+export POLAR_DYNAMIC_HISTORY_ENABLE=true
+export POLAR_DYNAMIC_HISTORY_MODE=trace
+export POLAR_STITCH_TRACES=true
+export POLAR_REJECT_LOGPROB_ERROR=true
+export POLAR_SEARCH_BRIDGE_MAX_TOKENS=true
+export POLAR_PREFIX_MERGING_MODE=prompt_grounded_single
+
+export POLAR_SAVE_FREQ=-1
+export POLAR_TEST_FREQ=-1
+export POLAR_LOG_LONGEST_TRACE_ARTIFACT=true
+export POLAR_LONGEST_TRACE_INTERVAL=10
+export POLAR_PROJECT_NAME=search_r1_like_async_rl
+export POLAR_EXPERIMENT_NAME=qwen3-4b-true-long
+export POLAR_DEFAULT_LOCAL_DIR="$PRO_RL_ROOT/checkpoints/search_verl_polar/qwen3_4b_true_long"
+export POLAR_RESUME_MODE=disable
+
+export POLAR_TRAINER_METRICS_DEBUG=1
+export POLAR_MANAGER_METRICS_DEBUG=1
+export RAY_DEDUP_LOGS=0
+export HYDRA_FULL_ERROR=1
+export PYTHONUNBUFFERED=1
+
+nohup examples/search_verl_polar/launch_polar_long.sh \
+  > "$LOG_DIR/launcher.out" 2>&1 &
+```
+
+### 8. Check logs and metrics
+
+```bash
+tail -200 "$LOG_DIR/launcher.out"
+tail -200 "$LOG_DIR/polar_rollout.out"
+tail -200 "$LOG_DIR/polar_gateway.out"
+tail -200 "$LOG_DIR/train_polar_long.out"
+```
+
+Useful metric grep:
+
+```bash
+grep -RInE 'training/global_step|polar/fanout_training|polar/trace|rollout_corr|dropped/no_trainable' \
+  "$LOG_DIR" /tmp/ray/session_latest/logs/worker-*.out 2>/dev/null | tail -50
+```
+
+Useful artifacts:
+
+```bash
+find "$LOG_DIR/artifacts" -maxdepth 3 -type f 2>/dev/null | sort
+```
+
+### 9. Common cleanup before rerun
+
+```bash
+ray stop --force || true
+
+lsof -ti tcp:30000 2>/dev/null | xargs -r kill -9 || true
+lsof -ti tcp:1249 2>/dev/null | xargs -r kill -9 || true
+lsof -ti tcp:18080 2>/dev/null | xargs -r kill -9 || true
+lsof -ti tcp:18100 2>/dev/null | xargs -r kill -9 || true
+lsof -ti tcp:8000  2>/dev/null | xargs -r kill -9 || true
+
+pkill -f "main_ppo.py" || true
+pkill -f "SGLangHttpServer" || true
+pkill -f "sglang.srt" || true
+pkill -f "sglang.launch_server" || true
+pkill -f "polar.cli serve_rollout" || true
+pkill -f "polar.cli serve_gateway" || true
+```
+
+---
 
 ## Architecture difference
 
@@ -102,6 +478,8 @@ Benefits:
 - **Less train/inference skew**: model calls are made through the same
   OpenAI-compatible pathway a black-box harness uses at inference time.
 
+---
+
 ## Prompt-grounded trajectory merging
 
 A search harness often calls the model multiple times in one episode:
@@ -111,8 +489,8 @@ prompt_0 -> assistant_0 -> tool_0 -> prompt_1 -> assistant_1 -> ...
 ```
 
 verl, however, trains on token rows with prompt tokens, response tokens, response
-logprobs, and a loss mask.  The bridge therefore reconstructs one training trace
-from many completion records.
+logprobs, rewards, and a loss mask.  The bridge therefore reconstructs one or
+more training rows from many completion records.
 
 The current merge mode is:
 
@@ -122,276 +500,79 @@ POLAR_PREFIX_MERGING_MODE=prompt_grounded_single
 
 The implementation is inspired by the trajectory merging approach used in slime,
 but the code and public configuration here use the neutral “prompt-grounded” name.
-Concretely:
 
-1. **Group append-only completions** by request/session metadata and strict token
-   prefix checks.
-2. **Use raw sampled assistant tokens** from each completion as trainable tokens,
-   preserving the exact token IDs and logprobs returned by rollout.
-3. **Use the next prompt as canonical context** for tool outputs, chat-template
-   glue, and intermediate user/tool messages.
-4. **Mask copied/interstitial context** with `loss_mask=0` and synthetic logprobs;
-   only sampled assistant spans get `loss_mask=1`.
-5. **Reset/truncate defensively** if the stitched prefix no longer matches the
-   next rollout prompt, instead of silently training on drifted tokens.
-
-### Detailed merge procedure
-
-Each model call is recorded as a completion trace:
+Each model call records a completion trace:
 
 ```text
 completion_i = {
   prompt_ids:        tokens that actually conditioned this rollout call,
   response_ids:      tokens sampled by the model for this call,
   response_logprobs: logprobs for response_ids,
-  response_messages: assistant/tool-call messages decoded by the harness,
   metadata:          request id, session id, reward/provenance fields, ...
 }
 ```
 
-The merge builder converts a chain of such completions into one verl training row
-with one `prompt_ids` prefix and one `response_ids` stream.  The response stream is
-a mixture of trainable sampled assistant spans and non-trainable context spans.
-The exact operation is:
+The bridge converts a chain of completions into a verl row:
 
-1. **Start from the first rollout prompt.**
-
-   ```text
-   merged_prompt = completion_0.prompt_ids
-   merged_response = []
-   loss_mask = []
-   logprob_slots = []
-   output_spans = []
-   ```
-
-2. **Append the current sampled response as a trainable span.**  For completion
-   `i`, its `response_ids` are appended directly, without decoding or re-tokenizing:
+1. Start from `completion_0.prompt_ids` as the row prompt.
+2. Append `completion_i.response_ids` as trainable assistant tokens with real
+   rollout logprobs and `loss_mask=1`.
+3. Before adding the next response, compare the stitched response stream with the
+   next real prompt:
 
    ```text
-   output_start = len(merged_response)
-   merged_response += completion_i.response_ids
-   loss_mask       += completion_i.response_loss_mask or 1s
-   logprob_slots   += completion_i.response_logprobs
-   output_spans.append([output_start, len(merged_response)))
+   prompt_suffix = completion_{i+1}.prompt_ids[len(prompt_ids):]
+   matched_len   = longest_common_prefix(response_stream, prompt_suffix)
    ```
 
-3. **Before appending the next response, reconcile against the next actual prompt.**
-   For completion `i + 1`, the prompt that the model actually saw should be:
-
-   ```text
-   completion_{i+1}.prompt_ids
-     = merged_prompt + already_accepted_assistant_or_context_tokens + new_context_tail
-   ```
-
-   The builder first verifies that `completion_{i+1}.prompt_ids` still starts with
-   `merged_prompt`.  If the base prompt changed, it treats this as a new segment:
-   reset `merged_prompt` to the current prompt and clear the in-segment response
-   stream.  This is safer than silently mixing unrelated prompts into one row.
-
-4. **Find the common prefix between the stitched response stream and the next
-   prompt suffix.**
-
-   ```text
-   prompt_suffix = completion_{i+1}.prompt_ids[len(merged_prompt):]
-   matched_len = longest_common_prefix(merged_response, prompt_suffix)
-   ```
-
-   `matched_len` tells us how much of the already-stitched stream is confirmed by
-   the next real rollout prompt.  If `matched_len < len(merged_response)`, the
-   stitched stream has drifted from the prompt that conditioned the next model
-   call.  The builder then truncates `merged_response`, `loss_mask`, and
-   `logprob_slots` back to `matched_len`.
-
-5. **If truncation cuts through an old assistant span, mask the retained prefix of
-   that partial span.**  A partial assistant span no longer corresponds to a full
-   sampled completion, so the retained partial tokens are kept as context but not
-   optimized:
-
-   ```text
-   loss_mask[partial_output_prefix] = 0
-   logprob_slots[partial_output_prefix] = synthetic_zero_logprobs
-   ```
-
-6. **Append the canonical context tail from the next prompt.**  The part of the
-   next prompt after `matched_len` is the tool output, chat-template glue, user
-   message, or other harness context that was present during rollout but was not
-   sampled by the policy in the previous step:
+4. If the stitched stream drifted from the next prompt, truncate to `matched_len`.
+   If truncation cuts an assistant span, keep the retained partial prefix only as
+   context with `loss_mask=0`.
+5. Append the canonical context tail from the next prompt:
 
    ```text
    context_tail = prompt_suffix[matched_len:]
-   merged_response += context_tail
-   loss_mask       += 0s
-   logprob_slots   += synthetic_zero_logprobs
    ```
 
-7. **Append the next sampled response with real logprobs**, then repeat the same
-   reconciliation process for the following completion.
+   These are tool outputs, user messages, search results, chat-template glue, or
+   harness state.  They are copied into the response stream with `loss_mask=0` and
+   synthetic zero logprobs.
+6. Append the next sampled assistant response with real logprobs and repeat.
 
-A small example:
-
-```text
-completion_0.prompt_ids   = P0
-completion_0.response_ids = A0_raw
-
-completion_1.prompt_ids   = P0 + A0_canonical_prefix + TOOL0 + USER1
-completion_1.response_ids = A1_raw
-```
-
-The merged row becomes:
+The resulting row looks like:
 
 ```text
-prompt_ids    = P0
-response_ids  = A0_raw_confirmed + TOOL0 + USER1 + A1_raw
-loss_mask     = 1s for confirmed sampled assistant tokens
-                0s for TOOL0 / USER1 / copied context
-                1s for A1_raw
-logprobs      = real rollout logprobs on sampled assistant spans
-                synthetic zero logprobs on masked context spans
+prompt_ids = P0
+
+responses  = A0_confirmed
+           + TOOL0
+           + USER1
+           + A1
+           + TOOL1
+           + USER2
+           + A2
+
+loss_mask  = 1s for confirmed sampled assistant tokens
+           + 0s for tool/user/context tokens
 ```
 
 The important detail is that `TOOL0 + USER1` comes from
 `completion_1.prompt_ids`, i.e. the canonical prompt that actually conditioned the
 next rollout call.  It is not reconstructed from a separately decoded transcript.
+This reduces train/inference inconsistency for long, multi-turn search agents.
 
-This helps avoid train/inference inconsistency: the next model call during rollout
-conditions on the harness-rendered prompt, and the training row is stitched back to
-that same prompt boundary rather than a separately decoded/re-encoded transcript.
-Sampled assistant tokens keep their rollout token IDs/logprobs, while tool outputs
-and prompt glue are retained only as masked context.
+---
 
-## Running the current true-long SearchR1 training
+## Current limitations
 
-This overlay keeps the minimal SearchR1 + Polar + VERL path for a Qwen-family
-policy model using `POLAR_PREFIX_MERGING_MODE=prompt_grounded_single` and fixed DataProto
-fanout training. Packed-variable, variable-training, and alignment/outlier debug
-patch paths are intentionally removed from the long-run command.
+This repo is phase 1: SearchR1 has been moved from standalone verl into the
+harness-driven architecture.  To support truly arbitrary search-agent harnesses,
+the following pieces still need to be generalized:
 
-All cluster-specific paths below are placeholders. Replace them with your own
-model, dataset, retrieval, and SearchR1 baseline file locations.
-
-### Current true-long command
-
-```bash
-ray stop --force || true
-
-lsof -ti tcp:30000 2>/dev/null | xargs -r kill -9 || true
-lsof -ti tcp:1249 2>/dev/null | xargs -r kill -9 || true
-lsof -ti tcp:18080 2>/dev/null | xargs -r kill -9 || true
-lsof -ti tcp:18100 2>/dev/null | xargs -r kill -9 || true
-
-pkill -f "main_ppo.py" || true
-pkill -f "SGLangHttpServer" || true
-pkill -f "sglang.srt" || true
-pkill -f "sglang.launch_server" || true
-pkill -f "retrieval_server_sglang_summarize.py" || true
-pkill -f "polar.cli serve_rollout" || true
-pkill -f "polar.cli serve_gateway" || true
-
-sleep 10
-nvidia-smi
-
-LOG_DIR=logs/search_verl_polar_qwen3_4b_true_long_$(date +%Y%m%d_%H%M%S) \
-VERL_ROOT=../verl \
-CONFIG_PATH=/path/to/search/config \
-CONFIG_NAME=search_multiturn_grpo \
-MODEL_PATH=/path/to/policy/model \
-POLAR_ROLLOUT_IS_TOKENIZER_PATH=/path/to/policy/model \
-RAW_TRAIN_DATA=/path/to/train.parquet \
-PREPARE_LONG_DATA=1 \
-TOOL_CONFIG=/path/to/search/config/tool_config/search_tool_config.yaml \
-POLAR_SEARCH_TOOL_CONFIG_PATH=/path/to/search/config/tool_config/search_tool_config.yaml \
-STANDALONE_TOOL_CONFIG_PATH=/path/to/search/config/tool_config/search_tool_config.yaml \
-SUMMARY_MODEL_PATH=/path/to/summary/model \
-RETRIEVAL_INDEX_PATH=/path/to/retrieval/index.faiss \
-RETRIEVAL_CORPUS_PATH=/path/to/retrieval/corpus.jsonl \
-RETRIEVER_MODEL_PATH=/path/to/retriever/model \
-RETRIEVAL_SERVER_SCRIPT=/path/to/retrieval_server_sglang_summarize.py \
-BASELINE_TOOL_PARSER_SRC=/path/to/search_baseline/tool_parser.py \
-BASELINE_SEARCH_TOOL_SRC=/path/to/search_baseline/search_tool.py \
-BASELINE_SEARCH_UTILS_SRC=/path/to/search_baseline/search_r1_like_utils.py \
-BASELINE_REWARD_SCORE_SRC=/path/to/search_baseline/search_r1_like_qa_em.py \
-BASELINE_REWARD_INIT_SRC=/path/to/search_baseline/__init__.py \
-SUMMARY_SGLANG_CUDA_VISIBLE_DEVICES=1 \
-RETRIEVAL_CUDA_VISIBLE_DEVICES=0,1,2,3 \
-TRAIN_CUDA_VISIBLE_DEVICES=4,5,6,7 \
-CUDA_VISIBLE_DEVICES=4,5,6,7 \
-START_SUMMARY_SGLANG=1 \
-START_RETRIEVAL_SERVER=1 \
-START_POLAR_SERVICES=1 \
-RESTART_POLAR_SERVICES=1 \
-RESTART_POLAR_GATEWAY=1 \
-RESTART_POLAR_ROLLOUT=1 \
-INSTALL_DEPS=1 \
-APPLY_VERL_PATCH=1 \
-APPLY_SEARCH_BASELINE_PATCHES=1 \
-POLAR_N_GPUS_PER_NODE=4 \
-POLAR_ROLLOUT_TP_SIZE=1 \
-POLAR_ROLLOUT_DP_SIZE=1 \
-POLAR_TRAIN_BATCH_SIZE=128 \
-POLAR_VAL_BATCH_SIZE=256 \
-POLAR_PPO_MINI_BATCH_SIZE=32 \
-POLAR_PPO_MICRO_BATCH_SIZE_PER_GPU=1 \
-POLAR_AGENT_NUM_WORKERS=128 \
-POLAR_ROLLOUT_N=8 \
-POLAR_TOTAL_EPOCHS=20 \
-POLAR_TOTAL_TRAINING_STEPS=null \
-POLAR_DATA_SHUFFLE=true \
-POLAR_DATA_SEED=2026 \
-POLAR_MAX_PROMPT_LENGTH=4096 \
-POLAR_MAX_RESPONSE_LENGTH=35000 \
-POLAR_FILTER_OVERLONG_PROMPTS=True \
-POLAR_DATA_TRUNCATION=error \
-POLAR_ROLLOUT_MAX_MODEL_LEN=40000 \
-SEARCH_MAX_MODEL_LEN=40000 \
-POLAR_ROLLOUT_GPU_MEMORY_UTILIZATION=0.5 \
-POLAR_ROLLOUT_TEMPERATURE=1.0 \
-POLAR_ROLLOUT_TOP_P=1.0 \
-POLAR_ROLLOUT_TOP_K=-1 \
-POLAR_ROLLOUT_REPETITION_PENALTY=1.0 \
-POLAR_ROLLOUT_DO_SAMPLE=true \
-SEARCH_TEMPERATURE=1.0 \
-SEARCH_TOP_P=1.0 \
-SEARCH_TOP_K=-1 \
-SEARCH_REPETITION_PENALTY=1.0 \
-SEARCH_DO_SAMPLE=true \
-SEARCH_MAX_TURNS=100 \
-SEARCH_MAX_TOKENS=35000 \
-SEARCH_MAX_TOOL_RESPONSE_LENGTH=2048 \
-SEARCH_TOOL_RESPONSE_TRUNCATE_SIDE=middle \
-SEARCH_RETRIEVAL_TIMEOUT=6000 \
-POLAR_FANOUT_TRAINING=1 \
-POLAR_MAX_ASYNC_LEVEL=2 \
-POLAR_MAX_CONCURRENCY=256 \
-POLAR_MAX_SESSION_CONCURRENCY=2048 \
-POLAR_REQUEST_TIMEOUT=3600 \
-POLAR_SGLANG_GENERATE_TIMEOUT=3600 \
-POLAR_OVERFLOW_POLICY=verl_truncate \
-POLAR_DYNAMIC_HISTORY_ENABLE=true \
-POLAR_DYNAMIC_HISTORY_MODE=trace \
-POLAR_STITCH_TRACES=true \
-POLAR_REJECT_LOGPROB_ERROR=true \
-POLAR_SEARCH_BRIDGE_MAX_TOKENS=true \
-POLAR_PREFIX_MERGING_MODE=prompt_grounded_single \
-POLAR_SAVE_FREQ=-1 \
-POLAR_TEST_FREQ=-1 \
-POLAR_LOG_LONGEST_TRACE_ARTIFACT=true \
-POLAR_LONGEST_TRACE_INTERVAL=10 \
-POLAR_PROJECT_NAME=search_r1_like_async_rl \
-POLAR_EXPERIMENT_NAME=qwen3-4b-true-long \
-POLAR_DEFAULT_LOCAL_DIR=checkpoints/search_verl_polar/qwen3_4b_true_long \
-POLAR_RESUME_MODE=disable \
-POLAR_TRAINER_METRICS_DEBUG=1 \
-POLAR_MANAGER_METRICS_DEBUG=1 \
-RAY_DEDUP_LOGS=0 \
-HYDRA_FULL_ERROR=1 \
-PYTHONUNBUFFERED=1 \
-nohup examples/search_verl_polar/launch_polar_long.sh >train.out &
-```
-
-### Notes
-
-- `POLAR_PREFIX_MERGING_MODE=prompt_grounded_single` selects the prompt-grounded single-trajectory merge builder.
-- `VERL_ROOT` points directly to the pinned verl checkout; no nested verl checkout is required.
-- `POLAR_FANOUT_TRAINING=1` keeps Polar dynamic-history/fanout rows in the fixed DataProto PPO update path.
-- `POLAR_SAVE_FREQ=-1` and `POLAR_TEST_FREQ=-1` disable periodic checkpoint/eval during this long run.
-- Trainer row alignment uses the original VERL row uid in `gen_batch_output.non_tensor_batch["source_uid"]`; dataset/provenance source ids remain in `polar_metadata` only.
+1. Explicit trace splitting when a harness resets, summarizes, compresses, or
+   branches context.
+2. Better support for variable batch size / variable fanout when different tasks
+   produce different numbers of trainable segments.
+3. A standard trace/reward schema across harnesses.
+4. Stronger train/inference consistency auditing for sampled assistant spans,
+   canonical context spans, truncation, masking, and reward assignment.
