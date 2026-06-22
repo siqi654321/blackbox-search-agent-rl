@@ -463,11 +463,30 @@ grep -RInE 'training/global_step|polar/fanout_training|polar/trace|rollout_corr|
   "$LOG_DIR" /tmp/ray/session_latest/logs/worker-*.out 2>/dev/null | tail -50
 ```
 
+For packed subagent/wipe runs, also check the parent-aware packed metrics:
+
+```bash
+grep -RInE 'polar/packed_variable_update/(parent_advantage_level|parent_sample_loss_enabled|parent_aware_minibatch|num_parent_samples|num_fanout_parent_samples|parent_rows_before_pad|parent_rows_after_pad|parent_minibatch_row_pad|updated|valid)' \
+  "$LOG_DIR" /tmp/ray/session_latest/logs/worker-*.out 2>/dev/null | tail -50
+```
+
 Useful artifacts:
 
 ```bash
 find "$LOG_DIR/artifacts" -maxdepth 3 -type f 2>/dev/null | sort
 ```
+
+If `POLAR_SUBAGENT_WIPE_INTERACTION_ARTIFACT=1`, sessions that contain both an
+applied subagent and an actual wipe are dumped as filtered static HTML:
+
+```bash
+find "$LOG_DIR/artifacts/subagent_wipe_interactions" -maxdepth 1 -type f -name '*.html' -print 2>/dev/null
+```
+
+Open `index.html` from that directory to inspect the chronological interaction:
+original prompt, main turns, tool calls/results, wipe event, subagent transcript,
+subagent report, and final answer.  This artifact is intended for human audit of
+whether segmentation matches the harness control flow.
 
 ### 9. Common cleanup before rerun
 
@@ -647,6 +666,34 @@ agent-like harnesses:
   padding-free actor update with row-order / row-pad compatibility.  Segment rows
   are carried through `polar_packed_variable_train_payload` instead of forcing
   every segment into the fixed prompt+response rectangle.
+
+The key training semantic is parent-aware: segments express harness control-flow
+boundaries, but the optimization target should stay close to one logical rollout
+sample.  With the current defaults:
+
+- `POLAR_SEGMENT_REWARD_MODE=none`: every emitted segment keeps the parent
+  outcome reward.  If a parent rollout with reward `R` produces `k` segments,
+  each segment stores `R`; it is not split into `R/k` unless
+  `POLAR_SEGMENT_REWARD_MODE=prompt_grounded_split` is set explicitly.
+- `POLAR_PACKED_ADVANTAGE_LEVEL=parent`: packed update first groups segment rows
+  by `parent_sample_uid`, computes GRPO advantage once per logical parent
+  rollout, then broadcasts that scalar advantage to all segments under the
+  parent.  A rollout with three segments therefore counts as one GRPO sample, not
+  three independent samples.
+- `POLAR_PACKED_PARENT_SAMPLE_LOSS=1`: each segment token uses the parent's total
+  trainable-token count as the loss denominator.  If one parent has segment
+  token counts `[100, 300, 600]`, every trainable token is scaled by `1/1000`, so
+  the parent contributes approximately one sample worth of loss instead of three.
+- `POLAR_PACKED_SEGMENT_WEIGHT_LOSS=1` is ignored while parent-sample loss is
+  enabled to avoid double scaling by both `1/k` and the parent token denominator.
+
+A concrete subagent + wipe episode is now visible in the HTML artifact.  For
+example, one audited run asks which of John Barrasso, Nancy Pelosi, Mark Amodei,
+and Bill Pascrell has the earliest birth date.  The main agent searches several
+people, wipes context after a later turn, delegates a subagent to collect birth
+years, receives the subagent report, and answers from the compacted main context.
+Training sees this as multiple prompt-grounded segments tied to the same parent
+rollout rather than one forced append-only row.
 
 The current true-long runbook uses these defaults:
 
