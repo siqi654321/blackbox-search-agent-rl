@@ -9,6 +9,8 @@ from typing import Any
 
 import httpx
 
+from polar.http_utils import polar_http_limits, polar_http_timeout
+
 logger = logging.getLogger(__name__)
 
 
@@ -70,7 +72,8 @@ class SGLangClient:
         if self._client is None or self._client.is_closed:
             self._client = httpx.AsyncClient(
                 base_url=self.base_url,
-                timeout=httpx.Timeout(self._LIVENESS_TIMEOUT_SECONDS, connect=30),
+                timeout=polar_http_timeout(self._LIVENESS_TIMEOUT_SECONDS, connect=30),
+                limits=polar_http_limits(),
             )
         return self._client
 

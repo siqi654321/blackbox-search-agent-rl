@@ -348,6 +348,9 @@ def _tensorize(values: dict[str, list[list[Any]]]) -> dict[str, Any]:
 
 def _num_turns(sample: VerlPolarSample) -> int:
     polar = sample.metadata.get("polar", {})
+    driver_num_turns = _driver_num_turns(sample)
+    if driver_num_turns is not None:
+        return driver_num_turns
     trace_debug = polar.get("trace_debug", {}) if isinstance(polar, dict) else {}
     response_messages = trace_debug.get("response_messages", []) if isinstance(trace_debug, dict) else []
     if isinstance(response_messages, list):
@@ -379,6 +382,32 @@ def _num_turns(sample: VerlPolarSample) -> int:
             return assistant_turns + tool_or_user_blocks + 1
         return 1 + len(response_messages)
     return 0
+
+
+def _driver_num_turns(sample: VerlPolarSample) -> int | None:
+    """Prefer evaluator's VERL-standalone turn count when available.
+
+    Prompt-grounded single true-long can truncate/re-ground the training trace for token
+    correctness.  That should not make the trainer-facing ``num_turns`` metric
+    drift from native VERL's rollout-level accounting, so use the evaluator's
+    transcript-derived ``driver_num_turns`` for final/main samples.
+    """
+
+    polar = sample.metadata.get("polar", {}) if isinstance(sample.metadata, dict) else {}
+    if not isinstance(polar, dict):
+        return None
+    kind = str(polar.get("segment_kind") or polar.get("segment_type") or "").strip().lower()
+    if kind in {"subagent", "wipe"}:
+        return None
+    evaluation = (polar.get("trajectory_metadata") or {}).get("evaluation") or {}
+    if not isinstance(evaluation, dict):
+        return None
+    raw = evaluation.get("driver_num_turns")
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
 
 
 

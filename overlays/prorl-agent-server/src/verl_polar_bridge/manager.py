@@ -13,9 +13,11 @@ from typing import Any
 
 import httpx
 
+from polar.http_utils import polar_async_client, polar_http_timeout
 from verl_polar_bridge.artifacts import (
     dump_aborted_samples,
     dump_dropped_events,
+    dump_full_trajectory_samples,
     dump_longest_trace,
     dump_validation_fanout,
     resolve_artifacts_dir,
@@ -25,8 +27,14 @@ from verl_polar_bridge.client import PolarGatewayClient
 from verl_polar_bridge.config import resolve_polar_verl_config
 from verl_polar_bridge.debug_utils import env_flag, env_int, stable_hash, token_preview
 from verl_polar_bridge.dataproto import prompt_rows_to_samples, samples_to_dataproto
+from verl_polar_bridge.adapter import VerlPolarSample, VerlPolarStatus
 from verl_polar_bridge.metrics import apply_metrics_prefix, summarize_samples
 from verl_polar_bridge.scheduler import AsyncPolarScheduler, PolarCompletedGroup
+from verl_polar_bridge.variable_pack import (
+    build_packed_variable_payload,
+    compact_samples_for_fixed_output,
+    resolve_packed_variable_config,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -149,10 +157,10 @@ class PolarAgentLoopManager:
         scheduler.set_rollout_context(global_steps)
         scheduler.update_policy_version(max(self._policy_version, global_steps))
         completed_groups: list[PolarCompletedGroup] = []
-        timeout = None if self.polar_config.request_timeout is None else httpx.Timeout(self.polar_config.request_timeout)
+        timeout = None if self.polar_config.request_timeout is None else polar_http_timeout(self.polar_config.request_timeout)
         callback_context = scheduler if self._scheduler_needs_callback_listener(scheduler) else _null_async_context()
         async with callback_context:
-            async with httpx.AsyncClient(timeout=timeout) as client:
+            async with polar_async_client(timeout=timeout) as client:
                 for group_index, row in enumerate(rows):
                     scheduler.submit_group(
                         row,
@@ -181,7 +189,7 @@ class PolarAgentLoopManager:
         polar_metrics = scheduler.snapshot_metrics()
         validation_fanout = None
         if bool(getattr(prompts, "meta_info", {}).get("validate", False)):
-            selected_samples = self._select_one_validation_sample_per_group(samples)
+            selected_samples = self._select_one_validation_sample_per_group(samples, rows=rows, prompts=prompts)
             validation_fanout = validation_fanout_payload(
                 samples,
                 input_rows=len(rows),
@@ -202,24 +210,58 @@ class PolarAgentLoopManager:
                 if _env_flag("POLAR_VALIDATION_FANOUT_VERBOSE"):
                     logger.warning("POLAR_VALIDATION_FANOUT_DEBUG_FULL %s", validation_fanout)
             samples = selected_samples
+        is_validate = bool(getattr(prompts, "meta_info", {}).get("validate", False))
         if not samples:
             raise RuntimeError(
                 "Polar rollout produced no accepted trainable samples; "
-                f"validate={bool(getattr(prompts, 'meta_info', {}).get('validate', False))} "
+                f"validate={is_validate} "
                 f"input_rows={len(rows)} completed_groups={len(completed_groups)} "
                 f"metrics={polar_metrics}"
             )
+        packed_variable_payload = None
+        packed_variable_metrics: dict[str, float] = {}
+        packed_variable_config = resolve_packed_variable_config()
+        if packed_variable_config.enabled and not is_validate:
+            packed_variable_payload, packed_variable_metrics = build_packed_variable_payload(
+                samples,
+                prompt_length=prompt_length,
+                response_length=response_length,
+                max_pack_tokens=packed_variable_config.max_pack_tokens,
+            )
+        fixed_output_samples = samples
+        if (
+            packed_variable_payload is not None
+            and _env_flag("POLAR_PACKED_VARIABLE_ACTOR_UPDATE")
+            and _env_flag("POLAR_PACKED_VARIABLE_COMPACT_FIXED_OUTPUT")
+        ):
+            fixed_output_samples = compact_samples_for_fixed_output(samples)
+            packed_variable_metrics["polar/packed_variable/fixed_output_compacted"] = 1.0
+            packed_variable_metrics["polar/packed_variable/fixed_output_sample_count"] = float(len(fixed_output_samples))
         output = samples_to_dataproto(
-            samples,
+            fixed_output_samples,
             prompt_length=prompt_length,
             response_length=response_length,
             pad_token_id=pad_token_id,
         )
+        if packed_variable_payload is not None:
+            output.meta_info["polar_packed_variable_train_payload"] = packed_variable_payload
         if not self.polar_config.dynamic_history_enable:
             output.meta_info.pop("polar_dynamic_history", None)
-        if bool(getattr(prompts, "meta_info", {}).get("validate", False)):
+        if is_validate:
             self._make_validation_union_safe(output, prompts)
         polar_metrics.update(summarize_samples(samples))
+        polar_metrics.update(packed_variable_metrics)
+        full_artifact_paths = self._maybe_dump_full_trajectory_artifacts(
+            samples,
+            global_steps=global_steps,
+            validate=is_validate,
+        )
+        if full_artifact_paths.get("validation") is not None:
+            polar_metrics["polar/artifacts/validation_trajectories_dumped"] = 1.0
+        if full_artifact_paths.get("subagent") is not None:
+            polar_metrics["polar/artifacts/subagent_trajectories_dumped"] = 1.0
+        if full_artifact_paths.get("full") is not None:
+            polar_metrics["polar/artifacts/full_trajectories_dumped"] = 1.0
         alignment_path = self._maybe_dump_alignment_debug_artifact(samples, output, global_steps=global_steps)
         if alignment_path is not None:
             polar_metrics["polar/artifacts/alignment_debug_dumped"] = 1.0
@@ -327,21 +369,27 @@ class PolarAgentLoopManager:
         # branch, so leaving the flag set only confuses debugging.
         getattr(output, "meta_info", {}).pop("polar_dynamic_history", None)
 
-    def _select_one_validation_sample_per_group(self, samples: list[Any]) -> list[Any]:
+    def _select_one_validation_sample_per_group(self, samples: list[Any], *, rows: list[Any], prompts: Any) -> list[Any]:
         """Keep validation rollout output one-to-one with VERL validation inputs.
 
         VERL validation directly unions ``test_batch`` with rollout output, so
         the output batch size must remain exactly the padded validation input
         size.  If Polar emits multiple traces for a session, choose the same kind
         of preferred row as the training prune fallback: non-placeholder,
-        trainable, then longest sequence.
+        trainable, then longest sequence.  If a validation group was dropped by
+        acceptance filtering, insert an all-zero placeholder for that exact
+        group index instead of shortening the output; otherwise VERL's later
+        unpad+union path can see fewer rows than the original validation batch.
         """
         grouped: dict[int, list[Any]] = {}
         for sample in samples:
             grouped.setdefault(int(getattr(sample, "group_index", 0)), []).append(sample)
         selected: list[Any] = []
-        for group_index in sorted(grouped):
-            selected.append(max(grouped[group_index], key=_validation_sample_preference))
+        for group_index, row in enumerate(rows):
+            if group_index in grouped:
+                selected.append(max(grouped[group_index], key=_validation_sample_preference))
+            else:
+                selected.append(_validation_placeholder_sample(row=row, group_index=group_index, prompts=prompts))
         return selected
 
     def _maybe_dump_longest_trace(self, samples: list[Any], *, global_steps: int) -> Path | None:
@@ -400,6 +448,65 @@ class PolarAgentLoopManager:
         except Exception:
             logger.exception("Failed to dump Polar validation fanout artifact to %s", path)
             return None
+
+    def _maybe_dump_full_trajectory_artifacts(
+        self,
+        samples: list[Any],
+        *,
+        global_steps: int,
+        validate: bool,
+    ) -> dict[str, Path | None]:
+        paths: dict[str, Path | None] = {"validation": None, "subagent": None, "full": None}
+        artifacts_dir = resolve_artifacts_dir()
+        if artifacts_dir is None:
+            return paths
+
+        if validate and env_flag("POLAR_VALIDATION_TRAJECTORY_ARTIFACT"):
+            limit = env_int("POLAR_VALIDATION_TRAJECTORY_LIMIT", 8)
+            path = artifacts_dir / f"validation_trajectories_step_{int(global_steps):06d}.jsonl"
+            try:
+                paths["validation"] = dump_full_trajectory_samples(
+                    samples,
+                    path,
+                    global_steps=global_steps,
+                    limit=limit,
+                    require_subagent=False,
+                    validate=True,
+                )
+            except Exception:
+                logger.exception("Failed to dump Polar validation trajectory artifact to %s", path)
+
+        if (not validate) and env_flag("POLAR_SUBAGENT_TRAJECTORY_ARTIFACT"):
+            limit = env_int("POLAR_SUBAGENT_TRAJECTORY_LIMIT", 8)
+            path = artifacts_dir / f"subagent_trajectories_step_{int(global_steps):06d}.jsonl"
+            try:
+                paths["subagent"] = dump_full_trajectory_samples(
+                    samples,
+                    path,
+                    global_steps=global_steps,
+                    limit=limit,
+                    require_subagent=True,
+                    validate=False,
+                )
+            except Exception:
+                logger.exception("Failed to dump Polar subagent trajectory artifact to %s", path)
+
+        if env_flag("POLAR_FULL_TRAJECTORY_ARTIFACT"):
+            limit = env_int("POLAR_FULL_TRAJECTORY_LIMIT", 8)
+            suffix = "validation" if validate else "train"
+            path = artifacts_dir / f"full_trajectories_{suffix}_step_{int(global_steps):06d}.jsonl"
+            try:
+                paths["full"] = dump_full_trajectory_samples(
+                    samples,
+                    path,
+                    global_steps=global_steps,
+                    limit=limit,
+                    require_subagent=env_flag("POLAR_FULL_TRAJECTORY_REQUIRE_SUBAGENT"),
+                    validate=validate,
+                )
+            except Exception:
+                logger.exception("Failed to dump Polar full trajectory artifact to %s", path)
+        return paths
 
     def update_policy_version(self, policy_version: int) -> None:
         """Hook for trainer/rollout code after serving weights are updated."""
@@ -478,7 +585,7 @@ class PolarAgentLoopManager:
             )
         elif self.server_handles:
             raise RuntimeError(
-                "Polar prompt-grounded bridge requires VERL rollout server_addresses for SGLang /generate; "
+                "Polar Prompt-grounded bridge requires VERL rollout server_addresses for SGLang /generate; "
                 "server_handles-only Ray actor path is disabled to avoid patching VERL internals."
             )
         else:
@@ -609,6 +716,57 @@ def _validation_sample_preference(sample: Any) -> tuple[int, int, int, int]:
     seqlen = len(prompt_ids) + len(response_ids)
     trace_index = int(getattr(sample, "trace_index", 0) or 0)
     return (0 if remove_sample else 1, int(trainable_tokens), int(seqlen), -trace_index)
+
+
+def _validation_placeholder_sample(*, row: Any, group_index: int, prompts: Any) -> VerlPolarSample:
+    """Return one validation-safe dummy rollout row for a dropped group.
+
+    The row is all-zero on the response side and marked ``remove_sample`` so
+    Polar metrics/artifacts can identify it.  It exists solely to preserve the
+    one-to-one batch-size contract required by VERL validation union.
+    """
+
+    prompt_ids = _prompt_ids_for_row(prompts, group_index)
+    uid = str(getattr(row, "uid", group_index))
+    metadata = {
+        "placeholder": True,
+        "validation_placeholder": True,
+        "group_index": int(group_index),
+        "sample_uid": uid,
+        "source_uid": uid,
+        "session_status": "VALIDATION_DROPPED",
+    }
+    return VerlPolarSample(
+        uid=uid,
+        group_index=int(group_index),
+        trajectory_index=0,
+        trace_index=-1,
+        prompt_ids=prompt_ids,
+        response_ids=[0],
+        response_mask=[0],
+        rollout_log_probs=[0.0],
+        reward=0.0,
+        status=VerlPolarStatus.ABORTED,
+        prompt=getattr(row, "prompt", ""),
+        response="",
+        metadata={"polar": metadata},
+        remove_sample=True,
+    )
+
+
+def _prompt_ids_for_row(prompts: Any, group_index: int) -> list[int]:
+    batch = getattr(prompts, "batch", None)
+    if batch is None or "prompts" not in batch:
+        return [0]
+    try:
+        values = batch["prompts"][int(group_index)]
+        if hasattr(values, "detach"):
+            values = values.detach().cpu().tolist()
+        elif hasattr(values, "tolist"):
+            values = values.tolist()
+        return [int(v) for v in values]
+    except Exception:
+        return [0]
 
 
 def _env_flag(name: str, default: str = "0") -> bool:

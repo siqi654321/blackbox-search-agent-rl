@@ -14,6 +14,68 @@ _PLACEHOLDER_RE = re.compile(r"{([^{}]+)}")
 _MISSING = object()
 
 
+def _env_first(names: tuple[str, ...], default: str) -> str:
+    for name in names:
+        value = os.environ.get(name)
+        if value is not None:
+            return value
+    return default
+
+
+def _search_wipe_settings(polar: Any) -> dict[str, Any]:
+    enable = _as_bool(
+        _get_path(
+            polar,
+            "search.wipe.enable",
+            default=_get_path(
+                polar,
+                "search.compaction.enable",
+                default=_env_first(
+                    ("POLAR_SEARCH_WIPE_ENABLE", "POLAR_SEARCH_COMPACTION_ENABLE"),
+                    "false",
+                ),
+            ),
+        ),
+        default=False,
+    )
+    max_turns = int(
+        _get_path(
+            polar,
+            "search.wipe.max_turns",
+            default=_get_path(
+                polar,
+                "search.compaction.max_turns",
+                default=_env_first(
+                    ("POLAR_SEARCH_WIPE_MAX_TURNS", "POLAR_SEARCH_COMPACTION_MAX_TURNS"),
+                    "0",
+                ),
+            ),
+        )
+    )
+    context_ratio = float(
+        _get_path(
+            polar,
+            "search.wipe.context_ratio",
+            default=_get_path(
+                polar,
+                "search.compaction.context_ratio",
+                default=_env_first(
+                    ("POLAR_SEARCH_WIPE_CONTEXT_RATIO", "POLAR_SEARCH_COMPACTION_CONTEXT_RATIO"),
+                    "0.0",
+                ),
+            ),
+        )
+    )
+    return {
+        "compaction_enable": enable,
+        "wipe_enable": enable,
+        "compaction_max_turns": max_turns,
+        "wipe_max_turns": max_turns,
+        "compaction_context_ratio": context_ratio,
+        "wipe_context_ratio": context_ratio,
+    }
+
+
 @dataclass(frozen=True)
 class PolarVerlConfig:
     """Resolved Polar settings consumed by the VERL agent-loop bridge."""
@@ -237,7 +299,7 @@ def resolve_polar_verl_config(config: Any) -> PolarVerlConfig:
         raise ValueError("polar.metrics.longest_trace_interval must be greater than 0")
 
     # Default remains baseline-compatible stitching: append-only Search traces are
-    # merged into one VERL row when safe. Complex/prompt-grounded all-trace runs can
+    # merged into one VERL row when safe. Complex/Prompt-grounded all-trace runs can
     # disable this so every builder trace becomes its own trainable segment.
     stitch_traces = bool(_get_any(polar, ("training.stitch_traces", "stitch_traces"), default=True))
 
@@ -593,6 +655,20 @@ def _apply_search_task_settings_overlay(task_template: dict[str, Any], polar: An
             )
         ),
     )
+    wipe_settings = _search_wipe_settings(polar)
+    subagent_settings = _search_subagent_settings(polar)
+    settings.setdefault("compaction_enable", wipe_settings["compaction_enable"])
+    settings.setdefault("wipe_enable", settings["compaction_enable"])
+    settings.setdefault("compaction_max_turns", wipe_settings["compaction_max_turns"])
+    settings.setdefault("wipe_max_turns", settings["compaction_max_turns"])
+    settings.setdefault("compaction_context_ratio", wipe_settings["compaction_context_ratio"])
+    settings.setdefault("wipe_context_ratio", settings["compaction_context_ratio"])
+    settings.setdefault("subagent_enable", subagent_settings["subagent_enable"])
+    settings.setdefault("max_subagents", subagent_settings["max_subagents"])
+    settings.setdefault("subagent_max_turns", subagent_settings["subagent_max_turns"])
+    settings.setdefault("subagent_max_tokens", subagent_settings["subagent_max_tokens"])
+    settings.setdefault("subagent_report_max_chars", subagent_settings["subagent_report_max_chars"])
+    settings.setdefault("subagent_report_format", subagent_settings["subagent_report_format"])
 
     # Also pass these through agent.env so runtimes that do not use settings in
     # process construction still expose the same values to the driver.
@@ -606,6 +682,18 @@ def _apply_search_task_settings_overlay(task_template: dict[str, Any], polar: An
                 "SEARCH_REPETITION_PENALTY": str(sampling["repetition_penalty"]),
                 "SEARCH_DO_SAMPLE": "true" if sampling["do_sample"] else "false",
                 "SEARCH_MAX_MODEL_LEN": str(settings["max_model_len"]),
+                "POLAR_SEARCH_WIPE_ENABLE": "true" if settings["compaction_enable"] else "false",
+                "POLAR_SEARCH_WIPE_MAX_TURNS": str(settings["compaction_max_turns"]),
+                "POLAR_SEARCH_WIPE_CONTEXT_RATIO": str(settings["compaction_context_ratio"]),
+                "POLAR_SEARCH_COMPACTION_ENABLE": "true" if settings["compaction_enable"] else "false",
+                "POLAR_SEARCH_COMPACTION_MAX_TURNS": str(settings["compaction_max_turns"]),
+                "POLAR_SEARCH_COMPACTION_CONTEXT_RATIO": str(settings["compaction_context_ratio"]),
+                "POLAR_SEARCH_SUBAGENT_ENABLE": "true" if settings["subagent_enable"] else "false",
+                "POLAR_SEARCH_MAX_SUBAGENTS": str(settings["max_subagents"]),
+                "POLAR_SEARCH_SUBAGENT_MAX_TURNS": str(settings["subagent_max_turns"]),
+                "POLAR_SEARCH_SUBAGENT_MAX_TOKENS": str(settings["subagent_max_tokens"]),
+                "POLAR_SEARCH_SUBAGENT_REPORT_MAX_CHARS": str(settings["subagent_report_max_chars"]),
+                "POLAR_SEARCH_SUBAGENT_REPORT_FORMAT": str(settings["subagent_report_format"]),
             }
         )
     return task_template
@@ -618,6 +706,23 @@ def _search_topk_settings(polar: Any) -> dict[str, int]:
     if value in (None, ""):
         return {}
     return {"topk": int(value)}
+
+
+def _search_subagent_settings(polar: Any) -> dict[str, Any]:
+    import os
+
+    enable = _as_bool(
+        _get_path(polar, "search.subagent.enable", default=os.environ.get("POLAR_SEARCH_SUBAGENT_ENABLE", "false")),
+        default=False,
+    )
+    return {
+        "subagent_enable": enable,
+        "max_subagents": int(_get_path(polar, "search.subagent.max_subagents", default=os.environ.get("POLAR_SEARCH_MAX_SUBAGENTS", "1"))),
+        "subagent_max_turns": int(_get_path(polar, "search.subagent.max_turns", default=os.environ.get("POLAR_SEARCH_SUBAGENT_MAX_TURNS", "3"))),
+        "subagent_max_tokens": int(_get_path(polar, "search.subagent.max_tokens", default=os.environ.get("POLAR_SEARCH_SUBAGENT_MAX_TOKENS", "4096"))),
+        "subagent_report_max_chars": int(_get_path(polar, "search.subagent.report_max_chars", default=os.environ.get("POLAR_SEARCH_SUBAGENT_REPORT_MAX_CHARS", "4096"))),
+        "subagent_report_format": str(_get_path(polar, "search.subagent.report_format", default=os.environ.get("POLAR_SEARCH_SUBAGENT_REPORT_FORMAT", "sections"))),
+    }
 
 
 def _search_sampling_settings(polar: Any) -> dict[str, Any]:
@@ -696,6 +801,8 @@ def _maybe_build_search_task_template(polar: Any) -> dict[str, Any] | None:
     repo_root = os.environ.get("PRO_RL_REPO_ROOT") or str(Path(__file__).resolve().parents[2])
     pythonpath = os.environ.get("PYTHONPATH", "")
     runtime_pythonpath = f"{repo_root}/src:{pythonpath}" if pythonpath else f"{repo_root}/src"
+    wipe_settings = _search_wipe_settings(polar)
+    subagent_settings = _search_subagent_settings(polar)
     return {
         "runtime": {
             "backend": "docker",
@@ -706,6 +813,15 @@ def _maybe_build_search_task_template(polar: Any) -> dict[str, Any] | None:
             "env": {
                 "PYTHONPATH": runtime_pythonpath,
                 "PRO_RL_REPO_ROOT": repo_root,
+                "POLAR_SEARCH_SUBAGENT_ENABLE": "true" if subagent_settings["subagent_enable"] else "false",
+                "POLAR_SEARCH_MAX_SUBAGENTS": str(subagent_settings["max_subagents"]),
+                "POLAR_SEARCH_SUBAGENT_MAX_TURNS": str(subagent_settings["subagent_max_turns"]),
+                "POLAR_SEARCH_SUBAGENT_MAX_TOKENS": str(subagent_settings["subagent_max_tokens"]),
+                "POLAR_SEARCH_SUBAGENT_REPORT_MAX_CHARS": str(subagent_settings["subagent_report_max_chars"]),
+                "POLAR_SEARCH_SUBAGENT_REPORT_FORMAT": str(subagent_settings["subagent_report_format"]),
+                "POLAR_SEARCH_WIPE_ENABLE": "true" if wipe_settings["wipe_enable"] else "false",
+                "POLAR_SEARCH_WIPE_MAX_TURNS": str(wipe_settings["wipe_max_turns"]),
+                "POLAR_SEARCH_WIPE_CONTEXT_RATIO": str(wipe_settings["wipe_context_ratio"]),
             },
         },
         "agent": {
@@ -731,12 +847,25 @@ def _maybe_build_search_task_template(polar: Any) -> dict[str, Any] | None:
                     )
                 ),
                 **_search_topk_settings(polar),
+                **wipe_settings,
+                **subagent_settings,
                 "tool_config_path": os.environ.get("POLAR_SEARCH_TOOL_CONFIG_PATH") or os.environ.get("STANDALONE_TOOL_CONFIG_PATH", ""),
                 "max_tool_response_length": int(os.environ.get("SEARCH_MAX_TOOL_RESPONSE_LENGTH", "2048")),
                 "tool_response_truncate_side": os.environ.get("SEARCH_TOOL_RESPONSE_TRUNCATE_SIDE", "middle"),
                 "format": os.environ.get("SEARCH_TOOL_FORMAT", "hermes"),
             },
-            "env": {"PYTHONPATH": runtime_pythonpath},
+            "env": {
+                "PYTHONPATH": runtime_pythonpath,
+                "POLAR_SEARCH_SUBAGENT_ENABLE": "true" if subagent_settings["subagent_enable"] else "false",
+                "POLAR_SEARCH_MAX_SUBAGENTS": str(subagent_settings["max_subagents"]),
+                "POLAR_SEARCH_SUBAGENT_MAX_TURNS": str(subagent_settings["subagent_max_turns"]),
+                "POLAR_SEARCH_SUBAGENT_MAX_TOKENS": str(subagent_settings["subagent_max_tokens"]),
+                "POLAR_SEARCH_SUBAGENT_REPORT_MAX_CHARS": str(subagent_settings["subagent_report_max_chars"]),
+                "POLAR_SEARCH_SUBAGENT_REPORT_FORMAT": str(subagent_settings["subagent_report_format"]),
+                "POLAR_SEARCH_WIPE_ENABLE": "true" if wipe_settings["wipe_enable"] else "false",
+                "POLAR_SEARCH_WIPE_MAX_TURNS": str(wipe_settings["wipe_max_turns"]),
+                "POLAR_SEARCH_WIPE_CONTEXT_RATIO": str(wipe_settings["wipe_context_ratio"]),
+            },
         },
         "builder": {"strategy": "prefix_merging"},
         "evaluator": {

@@ -41,7 +41,7 @@ def summarize_samples(samples: list[VerlPolarSample]) -> dict[str, float]:
 
 
 def polar_extra_metrics(samples: list[VerlPolarSample], rewards: list[float] | None = None) -> dict[str, float]:
-    """Compact Polar-compatible Polar metrics for logging."""
+    """Compact Prompt-grounded-compatible Polar metrics for logging."""
     rewards = [sample.reward for sample in samples if not sample.remove_sample] if rewards is None else rewards
     out: dict[str, float] = {}
     seen: set[str] = set()
@@ -64,7 +64,7 @@ def polar_extra_metrics(samples: list[VerlPolarSample], rewards: list[float] | N
     builder_per_request_sessions = 0
     prompt_alignment_mismatch_count_sum = 0.0
     prompt_alignment_mismatch_sample_count = 0
-    prompt_alignment_prompt_drift_tokens_sum = 0.0
+    prompt_alignment_prompt_grounded_drift_tokens_sum = 0.0
     adapter_prompt_alignment_mismatch_count_sum = 0.0
     adapter_prompt_alignment_mismatch_sample_count = 0
     prompt_grounded_single_reset_count_sum = 0.0
@@ -88,9 +88,9 @@ def polar_extra_metrics(samples: list[VerlPolarSample], rewards: list[float] | N
                 prompt_alignment_mismatch_count_sum += prompt_mismatch
                 if prompt_mismatch > 0:
                     prompt_alignment_mismatch_sample_count += 1
-            prompt_drift = _optional_float(trace_meta.get("prompt_alignment_prompt_drift_tokens_sum"))
+            prompt_drift = _optional_float(trace_meta.get("prompt_alignment_prompt_grounded_drift_tokens_sum"))
             if prompt_drift is not None:
-                prompt_alignment_prompt_drift_tokens_sum += prompt_drift
+                prompt_alignment_prompt_grounded_drift_tokens_sum += prompt_drift
             adapter_mismatch = _optional_float(trace_meta.get("adapter_prompt_alignment_mismatch_count"))
             if adapter_mismatch is not None:
                 adapter_prompt_alignment_mismatch_count_sum += adapter_mismatch
@@ -163,7 +163,15 @@ def polar_extra_metrics(samples: list[VerlPolarSample], rewards: list[float] | N
                         driver_timing.setdefault(str(key), []).append(float(value))
                     except (TypeError, ValueError):
                         pass
-            for key in ("driver_turns", "driver_tool_turns", "driver_response_budget_used", "driver_cumulative_completion_tokens"):
+            for key in (
+                "driver_turns",
+                "driver_tool_turns",
+                "driver_tool_blocks",
+                "driver_num_turns",
+                "driver_num_turns_tool_messages",
+                "driver_response_budget_used",
+                "driver_cumulative_completion_tokens",
+            ):
                 if key in evaluation:
                     try:
                         driver_timing.setdefault(key, []).append(float(evaluation[key]))
@@ -206,7 +214,7 @@ def polar_extra_metrics(samples: list[VerlPolarSample], rewards: list[float] | N
     out["polar/trace/builder_per_request_sessions"] = float(builder_per_request_sessions)
     out["polar/trace/prompt_alignment_mismatch_count_sum"] = float(prompt_alignment_mismatch_count_sum)
     out["polar/trace/prompt_alignment_mismatch_sample_count"] = float(prompt_alignment_mismatch_sample_count)
-    out["polar/trace/prompt_alignment_prompt_drift_tokens_sum"] = float(prompt_alignment_prompt_drift_tokens_sum)
+    out["polar/trace/prompt_alignment_prompt_grounded_drift_tokens_sum"] = float(prompt_alignment_prompt_grounded_drift_tokens_sum)
     out["polar/trace/adapter_prompt_alignment_mismatch_count_sum"] = float(adapter_prompt_alignment_mismatch_count_sum)
     out["polar/trace/adapter_prompt_alignment_mismatch_sample_count"] = float(adapter_prompt_alignment_mismatch_sample_count)
     out["polar/trace/prompt_grounded_single_reset_count_sum"] = float(prompt_grounded_single_reset_count_sum)
@@ -250,7 +258,7 @@ def _optional_float(value: Any) -> float | None:
 def apply_metrics_prefix(metrics: dict[str, float], prefix: str = "polar") -> dict[str, float]:
     """Rewrite canonical ``polar/`` metric keys to a configured prefix.
 
-    Internal helpers emit Polar-compatible ``polar/...`` keys.  Experiments can
+    Internal helpers emit Prompt-grounded-compatible ``polar/...`` keys.  Experiments can
     override the public prefix without changing every helper.
     """
     prefix = (prefix or "polar").strip().strip("/")

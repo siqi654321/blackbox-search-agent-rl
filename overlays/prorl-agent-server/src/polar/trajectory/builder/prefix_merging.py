@@ -140,11 +140,11 @@ def _prompt_alignment_span(
     if base_lcp == len(base_prompt_ids):
         prompt_suffix = current_prompt_ids[len(base_prompt_ids):]
         response_so_far = stitched_prefix_ids[len(base_prompt_ids):]
-        prompt_matched_len = _common_prefix_len(response_so_far, prompt_suffix)
+        prompt_grounded_matched_len = _common_prefix_len(response_so_far, prompt_suffix)
     else:
         prompt_suffix = []
         response_so_far = []
-        prompt_matched_len = 0
+        prompt_grounded_matched_len = 0
     response_start = max(0, len(stitched_prefix_ids) - len(base_prompt_ids))
     span = {
         "source": source,
@@ -162,8 +162,8 @@ def _prompt_alignment_span(
         "base_prompt_lcp": int(base_lcp),
         "prompt_suffix_len": len(prompt_suffix),
         "response_so_far_len": len(response_so_far),
-        "prompt_matched_len": int(prompt_matched_len),
-        "prompt_drift_tokens": max(0, len(response_so_far) - int(prompt_matched_len)),
+        "prompt_grounded_matched_len": int(prompt_grounded_matched_len),
+        "prompt_grounded_drift_tokens": max(0, len(response_so_far) - int(prompt_grounded_matched_len)),
         "interstitial_len": int(interstitial_len),
         "canonical_tail_len": int(canonical_tail_len),
         "prev_raw_response_len": int(prev_raw_response_len),
@@ -635,8 +635,8 @@ class PrefixMergingBuilder(BaseTrajectoryBuilder):
         metadata["prompt_alignment_mismatch_count"] = sum(
             1 for span in prompt_alignment_spans if not span.get("prompt_aligned")
         )
-        metadata["prompt_alignment_prompt_drift_tokens_sum"] = sum(
-            int(span.get("prompt_drift_tokens") or 0) for span in prompt_alignment_spans
+        metadata["prompt_alignment_prompt_grounded_drift_tokens_sum"] = sum(
+            int(span.get("prompt_grounded_drift_tokens") or 0) for span in prompt_alignment_spans
         )
         metadata["prompt_alignment_span_count"] = len(prompt_alignment_spans)
         if _prompt_alignment_audit_enabled():
@@ -659,7 +659,7 @@ class PrefixMergingBuilder(BaseTrajectoryBuilder):
         chain: list[CompletionRecord],
         stats: dict[str, int],
     ) -> Trace:
-        """Finalize one append-only chain using a prompt-grounded single-trace merge.
+        """Finalize one append-only chain using the reference implementation's prompt-grounded merge.
 
         Unlike the legacy canonical-tail stitcher, this path treats each
         completion's ``prompt_ids`` as the source of truth for the prefix that
@@ -668,7 +668,7 @@ class PrefixMergingBuilder(BaseTrajectoryBuilder):
         actual prompt suffix:
 
         * base prompt changed -> reset the in-segment state to the current turn
-          prompt, matching the defensive behavior of prompt-grounded turn merging;
+          prompt, matching the reference implementation's defensive behavior inside ``merge_turns``;
         * response-so-far drifted -> truncate to the matched prefix;
         * truncation cuts through a historical output span -> mask the retained
           partial prefix of that output span;
@@ -684,6 +684,7 @@ class PrefixMergingBuilder(BaseTrajectoryBuilder):
         response_messages: list[dict[str, Any]] = []
         prompt_alignment_spans: list[dict[str, Any]] = []
         kept = 0
+        msg_acc = len(first_trace.prompt_messages)
 
         resets = 0
         truncations = 0
@@ -716,6 +717,7 @@ class PrefixMergingBuilder(BaseTrajectoryBuilder):
                     loss_mask = []
                     output_spans = []
                     response_messages = []
+                    msg_acc = len(trace.prompt_messages)
                 else:
                     prompt_suffix = current_prompt_ids[len(prompt_ids) :]
                     matched_len = _common_prefix_len(response_ids, prompt_suffix)
@@ -761,6 +763,19 @@ class PrefixMergingBuilder(BaseTrajectoryBuilder):
                         response_slots.extend([None] * len(context_tail))
                         loss_mask.extend([0] * len(context_tail))
 
+                    # Message-level bookkeeping mirrors the legacy prefix
+                    # merger without touching token/loss streams.  The
+                    # prompt_grounded-single token path already injects tool/user
+                    # observations through ``context_tail`` with loss_mask=0;
+                    # appending the corresponding prompt messages here keeps
+                    # metadata-derived metrics such as ``num_turns`` aligned
+                    # with VERL standalone's ``user_turns + assistant_turns
+                    # + 1`` accounting.
+                    if len(trace.prompt_messages) > msg_acc:
+                        interstitial_msgs = trace.prompt_messages[msg_acc:]
+                        response_messages.extend(deepcopy(m) for m in interstitial_msgs)
+                        msg_acc += len(interstitial_msgs)
+
             alignment_span = _prompt_alignment_span(
                 source="prefix_merging_prompt_grounded_single",
                 completion_index=i,
@@ -782,6 +797,7 @@ class PrefixMergingBuilder(BaseTrajectoryBuilder):
             self._append_response_to_response_stream(trace, response_ids, response_slots, loss_mask)
             output_spans.append((output_start, len(response_ids)))
             response_messages.extend(deepcopy(m) for m in trace.response_messages)
+            msg_acc += len(trace.response_messages)
             kept += 1
 
         stats["completions_merged"] += kept
@@ -807,8 +823,8 @@ class PrefixMergingBuilder(BaseTrajectoryBuilder):
         metadata["prompt_alignment_mismatch_count"] = sum(
             1 for span in prompt_alignment_spans if not span.get("prompt_aligned")
         )
-        metadata["prompt_alignment_prompt_drift_tokens_sum"] = sum(
-            int(span.get("prompt_drift_tokens") or 0) for span in prompt_alignment_spans
+        metadata["prompt_alignment_prompt_grounded_drift_tokens_sum"] = sum(
+            int(span.get("prompt_grounded_drift_tokens") or 0) for span in prompt_alignment_spans
         )
         metadata["prompt_alignment_span_count"] = len(prompt_alignment_spans)
         if _prompt_alignment_audit_enabled():

@@ -71,6 +71,81 @@ class SearchR1Harness(BaseHarness):
         topk_arg = f"--topk {int(topk_value)} " if str(topk_value).strip() else ""
         max_tool_response_length = int(self.settings.get("max_tool_response_length", 2048))
         tool_response_truncate_side = str(self.settings.get("tool_response_truncate_side", "middle"))
+        compaction_enable = _bool_text(
+            self.settings.get(
+                "wipe_enable",
+                self.settings.get(
+                    "compaction_enable",
+                    _env_first(
+                        self.env,
+                        ("POLAR_SEARCH_WIPE_ENABLE", "POLAR_SEARCH_COMPACTION_ENABLE"),
+                        "false",
+                    ),
+                ),
+            )
+        )
+        compaction_max_turns = int(
+            self.settings.get(
+                "wipe_max_turns",
+                self.settings.get(
+                    "compaction_max_turns",
+                    _env_first(
+                        self.env,
+                        ("POLAR_SEARCH_WIPE_MAX_TURNS", "POLAR_SEARCH_COMPACTION_MAX_TURNS"),
+                        0,
+                    ),
+                ),
+            )
+        )
+        compaction_context_ratio = float(
+            self.settings.get(
+                "wipe_context_ratio",
+                self.settings.get(
+                    "compaction_context_ratio",
+                    _env_first(
+                        self.env,
+                        ("POLAR_SEARCH_WIPE_CONTEXT_RATIO", "POLAR_SEARCH_COMPACTION_CONTEXT_RATIO"),
+                        0.0,
+                    ),
+                ),
+            )
+        )
+        subagent_enable = _bool_text(
+            self.settings.get(
+                "subagent_enable",
+                _env_value(self.env, "POLAR_SEARCH_SUBAGENT_ENABLE", "false"),
+            )
+        )
+        max_subagents = int(
+            self.settings.get(
+                "max_subagents",
+                _env_value(self.env, "POLAR_SEARCH_MAX_SUBAGENTS", 1),
+            )
+        )
+        subagent_max_turns = int(
+            self.settings.get(
+                "subagent_max_turns",
+                _env_value(self.env, "POLAR_SEARCH_SUBAGENT_MAX_TURNS", 3),
+            )
+        )
+        subagent_max_tokens = int(
+            self.settings.get(
+                "subagent_max_tokens",
+                _env_value(self.env, "POLAR_SEARCH_SUBAGENT_MAX_TOKENS", 4096),
+            )
+        )
+        subagent_report_max_chars = int(
+            self.settings.get(
+                "subagent_report_max_chars",
+                _env_value(self.env, "POLAR_SEARCH_SUBAGENT_REPORT_MAX_CHARS", 4096),
+            )
+        )
+        subagent_report_format = str(
+            self.settings.get(
+                "subagent_report_format",
+                _env_value(self.env, "POLAR_SEARCH_SUBAGENT_REPORT_FORMAT", "sections"),
+            )
+        )
         # Do not JSON-encode here.  For SearchR1 alignment the scheduler may
         # pass the native VERL raw_chat as a JSON *array string*; double
         # encoding it turns `[{"role": ...}]` into the literal user message
@@ -113,6 +188,18 @@ class SearchR1Harness(BaseHarness):
             "STANDALONE_TOOL_CONFIG_PATH": tool_config_path,
             "SEARCH_MAX_MODEL_LEN": str(max_model_len),
             "POLAR_SEARCH_BRIDGE_MAX_TOKENS": bridge_max_tokens,
+            "POLAR_SEARCH_WIPE_ENABLE": compaction_enable,
+            "POLAR_SEARCH_WIPE_MAX_TURNS": str(compaction_max_turns),
+            "POLAR_SEARCH_WIPE_CONTEXT_RATIO": str(compaction_context_ratio),
+            "POLAR_SEARCH_COMPACTION_ENABLE": compaction_enable,
+            "POLAR_SEARCH_COMPACTION_MAX_TURNS": str(compaction_max_turns),
+            "POLAR_SEARCH_COMPACTION_CONTEXT_RATIO": str(compaction_context_ratio),
+            "POLAR_SEARCH_SUBAGENT_ENABLE": subagent_enable,
+            "POLAR_SEARCH_MAX_SUBAGENTS": str(max_subagents),
+            "POLAR_SEARCH_SUBAGENT_MAX_TURNS": str(subagent_max_turns),
+            "POLAR_SEARCH_SUBAGENT_MAX_TOKENS": str(subagent_max_tokens),
+            "POLAR_SEARCH_SUBAGENT_REPORT_MAX_CHARS": str(subagent_report_max_chars),
+            "POLAR_SEARCH_SUBAGENT_REPORT_FORMAT": subagent_report_format,
         }
         if str(topk_value).strip():
             step_env["SEARCH_TOPK"] = str(int(topk_value))
@@ -151,6 +238,16 @@ def _env_value(mapping: dict[str, str], name: str, default: object) -> object:
     if name in mapping:
         return mapping[name]
     return os.environ.get(name, default)
+
+
+def _env_first(mapping: dict[str, str], names: tuple[str, ...], default: object) -> object:
+    for name in names:
+        if name in mapping:
+            return mapping[name]
+        value = os.environ.get(name)
+        if value is not None:
+            return value
+    return default
 
 
 def _bool_text(value: object) -> str:

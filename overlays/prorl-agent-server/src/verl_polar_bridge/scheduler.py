@@ -11,6 +11,7 @@ import os
 from typing import Any
 
 import httpx
+from polar.http_utils import polar_async_client
 from fastapi import FastAPI, Request
 
 from verl_polar_bridge.adapter import VerlPolarSample, task_result_to_verl_samples
@@ -208,7 +209,7 @@ class PolarScheduler:
 class PolarCallbackWaiter:
     """Async callback-first waiter with polling fallback for Polar tasks.
 
-    This mirrors the critical VERL+Polar behavior: register the task event
+    This mirrors the critical Polar bridge behavior: register the task event
     before submit, inject ``callback_url`` into the payload, accept trainer-side
     ``TaskResult`` callbacks at ``/callback/task_result``, and defensively poll
     ``/rollout/task/{task_id}`` when callbacks are delayed or lost.
@@ -327,7 +328,7 @@ class PolarCallbackWaiter:
 
 
 class AsyncPolarScheduler:
-    """Callback-capable async scheduler with prompt-grounded queue semantics.
+    """Callback-capable async scheduler with Prompt-grounded queue semantics.
 
     The class can still be used directly via ``rollout_group`` for tests and
     simple scripts, but it also exposes queue-oriented APIs for the VERL manager:
@@ -395,7 +396,7 @@ class AsyncPolarScheduler:
         owns_client = client is None
         timeout = self.polar_config.request_timeout
         if client is None:
-            client = httpx.AsyncClient(timeout=timeout)
+            client = polar_async_client(timeout=timeout)
         try:
             task_result = await self.callback_waiter.submit_with_callback(client, payload)
             samples = _convert_and_record(

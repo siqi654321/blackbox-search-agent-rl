@@ -12,6 +12,7 @@ from typing import Any
 
 import httpx
 
+from polar.http_utils import polar_async_client
 from polar.platform.events import EventBus
 from polar.rollout.balancer import NodeScheduler
 from polar.rollout.models import (
@@ -148,14 +149,14 @@ class RolloutManager:
     async def _post_callback(self, callback_url: str, result: TaskResult) -> None:
         """Best-effort POST the terminal TaskResult to the trainer's callback URL."""
         try:
-            async with httpx.AsyncClient(timeout=_CALLBACK_TIMEOUT_SECONDS) as client:
+            async with polar_async_client(timeout=_CALLBACK_TIMEOUT_SECONDS) as client:
                 response = await client.post(
                     callback_url,
                     json=result.model_dump(mode="json"),
                 )
                 response.raise_for_status()
         except Exception as exc:
-            # Callback delivery is intentionally best-effort: VERL/Polar
+            # Callback delivery is intentionally best-effort: VERL/the reference implementation
             # schedulers always retain a polling fallback.  Do not emit a full
             # traceback here, otherwise successful eval-only validation runs are
             # classified as failures by log scanners even though the trainer

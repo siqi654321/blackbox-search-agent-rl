@@ -9,6 +9,7 @@ import hashlib
 import json
 import logging
 import os
+from collections import OrderedDict
 from typing import Any, TYPE_CHECKING
 
 from verl_polar_bridge._messages import messages_to_text
@@ -83,12 +84,43 @@ def session_result_to_verl_samples(
     token-prefix invariants do not hold.
     """
     traces = list(result.trajectory.traces)
+    source_uid = (
+        (getattr(result, "metadata", {}) or {}).get("source_uid")
+        if isinstance(getattr(result, "metadata", None), dict)
+        else None
+    )
     if stitch_traces:
+        if _env_flag("POLAR_STITCH_BY_MERGE_GROUP", default=False):
+            grouped_traces = _try_stitch_trace_groups(
+                traces,
+                session_id=getattr(result, "session_id", None),
+                task_id=getattr(result, "task_id", None),
+                source_uid=source_uid,
+            )
+            if grouped_traces:
+                grouped_samples: list[VerlPolarSample] = []
+                for trace_index, trace in enumerate(grouped_traces):
+                    sample = _build_sample(
+                        result=result,
+                        trace=trace,
+                        trace_index=trace_index,
+                        group_index=group_index,
+                        trajectory_index=trajectory_index,
+                        uid=uid,
+                        reward_key=reward_key,
+                        max_tokens=max_tokens,
+                        overflow_policy=overflow_policy,
+                    )
+                    if sample is not None:
+                        grouped_samples.append(sample)
+                if grouped_samples:
+                    return _annotate_segment_samples(grouped_samples)
+
         merged_trace = _try_stitch_traces(
             traces,
             session_id=getattr(result, "session_id", None),
             task_id=getattr(result, "task_id", None),
-            source_uid=(getattr(result, "metadata", {}) or {}).get("source_uid") if isinstance(getattr(result, "metadata", None), dict) else None,
+            source_uid=source_uid,
         )
         if merged_trace is not None:
             sample = _build_sample(
@@ -103,7 +135,7 @@ def session_result_to_verl_samples(
                 overflow_policy=overflow_policy,
             )
             if sample is not None:
-                return [sample]
+                return _annotate_segment_samples([sample])
     samples: list[VerlPolarSample] = []
     for trace_index, trace in enumerate(traces):
         sample = _build_sample(
@@ -121,7 +153,7 @@ def session_result_to_verl_samples(
             samples.append(sample)
 
     if samples:
-        return samples
+        return _annotate_segment_samples(samples)
 
     logger.warning(
         "Session %s: no usable trace (traces=%d, max_tokens=%s); emitting placeholder",
@@ -138,7 +170,6 @@ def session_result_to_verl_samples(
             reward_key=reward_key,
         )
     ]
-
 
 def task_result_to_verl_samples(
     task_result: Any,
@@ -166,6 +197,105 @@ def task_result_to_verl_samples(
         )
     return samples
 
+
+def _env_flag(name: str, *, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _try_stitch_trace_groups(
+    traces: list[Any],
+    *,
+    session_id: str | None = None,
+    task_id: str | None = None,
+    source_uid: str | None = None,
+) -> list[Any] | None:
+    if not traces:
+        return None
+    groups: "OrderedDict[str, list[Any]]" = OrderedDict()
+    for idx, trace in enumerate(traces):
+        group_id = _trace_merge_group_id(trace) or f"__trace_{idx}"
+        groups.setdefault(str(group_id), []).append(trace)
+    if len(groups) <= 1:
+        return None
+
+    merged: list[Any] = []
+    for group_id, group_traces in groups.items():
+        if len(group_traces) == 1:
+            merged.append(group_traces[0])
+            continue
+        stitched = _try_stitch_traces(
+            group_traces,
+            session_id=session_id,
+            task_id=task_id,
+            source_uid=source_uid,
+        )
+        if stitched is None:
+            logger.warning(
+                "Session %s: merge_group_id=%s could not be stitched; falling back to %d per-turn traces",
+                session_id,
+                group_id,
+                len(group_traces),
+            )
+            merged.extend(group_traces)
+        else:
+            merged.append(stitched)
+    return merged
+
+
+def _annotate_segment_samples(samples: list[VerlPolarSample]) -> list[VerlPolarSample]:
+    if not samples:
+        return samples
+    k = len(samples)
+    parent_trainable_tokens = sum(int(sum(int(v) for v in (sample.response_mask or []))) for sample in samples)
+    final_wipe_index = _max_segment_kind_index(samples, kind="wipe")
+    reward_mode = os.environ.get("POLAR_SEGMENT_REWARD_MODE", "none").strip().lower()
+    split_reward = reward_mode in {"prompt_grounded_split", "split", "r_over_k", "reward_split"}
+    for idx, sample in enumerate(samples):
+        polar = sample.metadata.setdefault("polar", {})
+        if not isinstance(polar, dict):
+            sample.metadata["polar"] = polar = {}
+        kind = str(polar.get("segment_kind") or "").strip().lower()
+        try:
+            merge_group_index = int(polar.get("merge_group_index") or 0)
+        except (TypeError, ValueError):
+            merge_group_index = 0
+        is_last_main_wipe = kind == "wipe" and final_wipe_index is not None and merge_group_index == final_wipe_index
+        if is_last_main_wipe:
+            polar["segment_kind"] = "final"
+            polar["is_final_segment"] = True
+        original_reward = float(sample.reward)
+        if split_reward:
+            sample.reward = original_reward / max(1, k)
+        polar.setdefault("sample_uid", sample.uid)
+        polar["segment_idx"] = int(idx)
+        polar["num_segments"] = int(k)
+        polar["prompt_grounded_segment_count"] = int(k)
+        polar["segment_weight"] = 1.0 / max(1, k)
+        polar["prompt_grounded_segment_reward_split"] = bool(split_reward)
+        polar["original_reward"] = original_reward
+        polar["segment_reward"] = float(sample.reward)
+        polar["parent_sample_trainable_tokens"] = int(parent_trainable_tokens)
+    return samples
+
+
+def _max_segment_kind_index(samples: list[VerlPolarSample], *, kind: str) -> int | None:
+    indices: list[int] = []
+    target = str(kind).strip().lower()
+    for sample in samples:
+        polar = sample.metadata.get("polar", {}) if isinstance(sample.metadata, dict) else {}
+        if not isinstance(polar, dict):
+            continue
+        if str(polar.get("segment_kind") or "").strip().lower() != target:
+            continue
+        try:
+            indices.append(int(polar.get("merge_group_index") or 0))
+        except (TypeError, ValueError):
+            indices.append(0)
+    return max(indices) if indices else None
+
 def _try_stitch_traces(
     traces: list[Any],
     *,
@@ -182,6 +312,17 @@ def _try_stitch_traces(
 
     if len(traces) <= 1:
         _log_stitch_debug("skip", reason="single_or_no_trace", context=debug_context, traces=traces, extra={})
+        return None
+    merge_group_ids = [_trace_merge_group_id(trace) for trace in traces]
+    explicit_merge_group_ids = [value for value in merge_group_ids if value is not None]
+    if explicit_merge_group_ids and len(set(explicit_merge_group_ids)) > 1:
+        _log_stitch_debug(
+            "skip",
+            reason="multiple_merge_groups",
+            context=debug_context,
+            traces=traces,
+            extra={"merge_group_ids": merge_group_ids},
+        )
         return None
     first = traces[0]
     prompt_ids = list(getattr(first, "prompt_ids", []) or [])
@@ -279,8 +420,8 @@ def _try_stitch_traces(
     metadata["adapter_prompt_alignment_mismatch_count"] = sum(
         1 for span in prompt_alignment_spans if not span.get("prompt_aligned")
     )
-    metadata["adapter_prompt_alignment_prompt_drift_tokens_sum"] = sum(
-        int(span.get("prompt_drift_tokens") or 0) for span in prompt_alignment_spans
+    metadata["adapter_prompt_alignment_prompt_grounded_drift_tokens_sum"] = sum(
+        int(span.get("prompt_grounded_drift_tokens") or 0) for span in prompt_alignment_spans
     )
     metadata["adapter_prompt_alignment_span_count"] = len(prompt_alignment_spans)
     if _prompt_alignment_audit_enabled():
@@ -410,11 +551,11 @@ def _adapter_prompt_alignment_span(
     if base_lcp == len(base_prompt_ids):
         prompt_suffix = current_prompt_ids[len(base_prompt_ids):]
         response_so_far = stitched_prefix_ids[len(base_prompt_ids):]
-        prompt_matched_len = _common_prefix_len(response_so_far, prompt_suffix)
+        prompt_grounded_matched_len = _common_prefix_len(response_so_far, prompt_suffix)
     else:
         prompt_suffix = []
         response_so_far = []
-        prompt_matched_len = 0
+        prompt_grounded_matched_len = 0
     metadata = getattr(trace, "metadata", {}) or {}
     if not isinstance(metadata, dict):
         metadata = {}
@@ -435,8 +576,8 @@ def _adapter_prompt_alignment_span(
         "base_prompt_lcp": int(base_lcp),
         "prompt_suffix_len": len(prompt_suffix),
         "response_so_far_len": len(response_so_far),
-        "prompt_matched_len": int(prompt_matched_len),
-        "prompt_drift_tokens": max(0, len(response_so_far) - int(prompt_matched_len)),
+        "prompt_grounded_matched_len": int(prompt_grounded_matched_len),
+        "prompt_grounded_drift_tokens": max(0, len(response_so_far) - int(prompt_grounded_matched_len)),
         "interstitial_len": int(interstitial_len),
     }
     if not prompt_aligned:
@@ -854,8 +995,45 @@ def _polar_metadata(result: "SessionResult", trace: "Trace | None", trace_index:
             "finish_reason": trace.finish_reason,
             "response_messages": deepcopy(trace.response_messages),
         }
+        metadata.update(_segment_metadata(trace))
     metadata.update(_scheduler_metadata(result, trace))
     return metadata
+
+
+def _trace_merge_group_id(trace: Any) -> str | None:
+    metadata = getattr(trace, "metadata", None)
+    if not isinstance(metadata, dict):
+        return None
+    value = metadata.get("merge_group_id") or metadata.get("segment_group_id")
+    return None if value is None else str(value)
+
+
+def _segment_metadata(trace: "Trace") -> dict[str, Any]:
+    trace_meta = getattr(trace, "metadata", {}) or {}
+    if not isinstance(trace_meta, dict):
+        return {}
+    out: dict[str, Any] = {}
+    for key in (
+        "merge_group_id",
+        "merge_group_index",
+        "num_merge_groups",
+        "segment_kind",
+        "is_final_segment",
+        "segment_weight",
+        "segment_group_id",
+        "parent_merge_group_id",
+        "dispatch_index",
+        "segment_index",
+        "harness_event",
+        "harness_mode",
+    ):
+        if key in trace_meta:
+            out[key] = deepcopy(trace_meta[key])
+    if "segment_kind" not in out and "segment_type" in trace_meta:
+        out["segment_kind"] = deepcopy(trace_meta["segment_type"])
+    if "merge_group_id" not in out and "segment_group_id" in out:
+        out["merge_group_id"] = out["segment_group_id"]
+    return out
 
 
 def _scheduler_metadata(result: "SessionResult", trace: "Trace | None") -> dict[str, Any]:

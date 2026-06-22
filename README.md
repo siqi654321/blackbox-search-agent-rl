@@ -48,7 +48,7 @@ From that directory, the pinned verl checkout is the sibling path:
 ../verl
 ```
 
-There is no nested `open_verl` checkout in this repo.
+There is no extra nested verl checkout in this repo.
 
 ---
 
@@ -331,14 +331,21 @@ export POLAR_ROLLOUT_N=8
 export POLAR_TOTAL_EPOCHS=20
 export POLAR_TOTAL_TRAINING_STEPS=null
 
+export POLAR_DATA_SHUFFLE=true
+export POLAR_DATA_SEED=2026
 export POLAR_MAX_PROMPT_LENGTH=4096
 export POLAR_MAX_RESPONSE_LENGTH=35000
+export POLAR_FILTER_OVERLONG_PROMPTS=True
+export POLAR_DATA_TRUNCATION=error
 export POLAR_ROLLOUT_MAX_MODEL_LEN=40000
 export SEARCH_MAX_MODEL_LEN=40000
+export POLAR_ROLLOUT_GPU_MEMORY_UTILIZATION=0.5
+
 export SEARCH_MAX_TURNS=100
 export SEARCH_MAX_TOKENS=35000
 export SEARCH_MAX_TOOL_RESPONSE_LENGTH=2048
 export SEARCH_TOOL_RESPONSE_TRUNCATE_SIDE=middle
+export SEARCH_RETRIEVAL_TIMEOUT=6000
 
 export POLAR_ROLLOUT_TEMPERATURE=1.0
 export POLAR_ROLLOUT_TOP_P=1.0
@@ -351,6 +358,11 @@ export SEARCH_TOP_K=-1
 export SEARCH_REPETITION_PENALTY=1.0
 export SEARCH_DO_SAMPLE=true
 
+export POLAR_HTTP_MAX_CONNECTIONS=2048
+export POLAR_HTTP_MAX_KEEPALIVE_CONNECTIONS=1024
+export POLAR_HTTP_POOL_TIMEOUT=600
+export POLAR_HTTP_KEEPALIVE_EXPIRY=60
+
 export POLAR_FANOUT_TRAINING=1
 export POLAR_MAX_ASYNC_LEVEL=2
 export POLAR_MAX_CONCURRENCY=256
@@ -358,20 +370,71 @@ export POLAR_MAX_SESSION_CONCURRENCY=2048
 export POLAR_REQUEST_TIMEOUT=3600
 export POLAR_SGLANG_GENERATE_TIMEOUT=3600
 export POLAR_OVERFLOW_POLICY=verl_truncate
+
+# True-long prompt-grounded stitching.
 export POLAR_DYNAMIC_HISTORY_ENABLE=true
 export POLAR_DYNAMIC_HISTORY_MODE=trace
 export POLAR_STITCH_TRACES=true
+export POLAR_STITCH_BY_MERGE_GROUP=1
 export POLAR_REJECT_LOGPROB_ERROR=true
 export POLAR_SEARCH_BRIDGE_MAX_TOKENS=true
 export POLAR_PREFIX_MERGING_MODE=prompt_grounded_single
+
+# Current long-run path: packed actor update with row-order / row-pad
+# compatibility, not the variable-row minibatch path.
+export POLAR_PACKED_VARIABLE_ENABLE=1
+export POLAR_PACKED_VARIABLE_ACTOR_UPDATE=1
+export POLAR_PACKED_VARIABLE_PARTITION_MODE=row_order
+export POLAR_PACKED_VARIABLE_LEGACY_LOSS_SCALE=1
+export POLAR_PACKED_VARIABLE_COMPACT_FIXED_OUTPUT=1
+export POLAR_PACKED_VARIABLE_MINIBATCH_MODE=row_pad
+export POLAR_PACKED_VARIABLE_ROW_PAD=1
+
+# Parent-aware semantics for subagent/wipe segmented traces.
+export POLAR_SEGMENT_REWARD_MODE=none
+export POLAR_PACKED_ADVANTAGE_LEVEL=parent
+export POLAR_PACKED_PARENT_SAMPLE_LOSS=1
+export POLAR_PACKED_SEGMENT_WEIGHT_LOSS=1
+
+# Subagent fanout.
+export POLAR_SEARCH_SUBAGENT_ENABLE=1
+export POLAR_SEARCH_MAX_SUBAGENTS=1
+export POLAR_SEARCH_SUBAGENT_MAX_TURNS=2
+export POLAR_SEARCH_SUBAGENT_MAX_TOKENS=4096
+export POLAR_SEARCH_SUBAGENT_REPORT_MAX_CHARS=4096
+export POLAR_SEARCH_SUBAGENT_REPORT_FORMAT=sections
+export POLAR_SEARCH_SUBAGENT_CONTEXT_MAX_CHARS=2048
+
+# Wipe/context compaction.
+export POLAR_SEARCH_WIPE_ENABLE=1
+export POLAR_SEARCH_WIPE_MAX_TURNS=4
+export POLAR_SEARCH_WIPE_CONTEXT_RATIO=0.50
+export POLAR_SEARCH_COMPACTION_ENABLE=$POLAR_SEARCH_WIPE_ENABLE
+export POLAR_SEARCH_COMPACTION_MAX_TURNS=$POLAR_SEARCH_WIPE_MAX_TURNS
+export POLAR_SEARCH_COMPACTION_CONTEXT_RATIO=$POLAR_SEARCH_WIPE_CONTEXT_RATIO
+
+# Human-readable filtered interaction artifact for sessions with subagent + wipe.
+export POLAR_SUBAGENT_WIPE_INTERACTION_ARTIFACT=1
+export POLAR_SUBAGENT_WIPE_INTERACTION_FORMAT=html
+export POLAR_SUBAGENT_WIPE_INTERACTION_TOOL_MAX_CHARS=20000
+export POLAR_SEARCH_DRIVER_DEBUG=1
+export POLAR_SEARCH_DRIVER_DEBUG_LIMIT=32
+
+export POLAR_ACTOR_KL_LOSS_COEF=0.0001
+export POLAR_ACTOR_KL_LOSS_TYPE=low_var_kl
+export POLAR_ACTOR_ENTROPY_COEFF=0
+export POLAR_ACTOR_LR=1e-6
+export POLAR_ACTOR_LR_WARMUP_STEPS_RATIO=0.0
+export POLAR_ROLLOUT_LOG_PROB_MICRO_BATCH_SIZE_PER_GPU=1
+export POLAR_REF_LOG_PROB_MICRO_BATCH_SIZE_PER_GPU=1
 
 export POLAR_SAVE_FREQ=-1
 export POLAR_TEST_FREQ=-1
 export POLAR_LOG_LONGEST_TRACE_ARTIFACT=true
 export POLAR_LONGEST_TRACE_INTERVAL=10
 export POLAR_PROJECT_NAME=search_r1_like_async_rl
-export POLAR_EXPERIMENT_NAME=qwen3-4b-true-long
-export POLAR_DEFAULT_LOCAL_DIR="$PRO_RL_ROOT/checkpoints/search_verl_polar/qwen3_4b_true_long"
+export POLAR_EXPERIMENT_NAME=qwen3-4b-pack-subagent-wipe-true-long-parent-row-pad
+export POLAR_DEFAULT_LOCAL_DIR="$PRO_RL_ROOT/checkpoints/search_verl_polar/qwen3_4b_pack_subagent_wipe_true_long_parent_row_pad"
 export POLAR_RESUME_MODE=disable
 
 export POLAR_TRAINER_METRICS_DEBUG=1
@@ -563,16 +626,92 @@ This reduces train/inference inconsistency for long, multi-turn search agents.
 
 ---
 
+## Phase-2 segmentation and packed update support
+
+The first version of this repo only supported append-only prompt-grounded merging.
+The current overlay also contains the next layer needed for longer and more
+agent-like harnesses:
+
+- **Subagent fanout**: a SearchR1 harness can expose a `subagent` tool.  A
+  subagent runs as its own search loop, returns a bounded report to the main
+  agent, and is emitted as a separate trainable segment with the same parent
+  rollout uid.
+- **Wipe / compaction fanout**: the main agent can close the current segment,
+  compact old context into a digest, and continue in a fresh segment.  This is
+  the first step toward supporting harnesses that reset or compress context.
+- **Segment-aware reward / metadata**: emitted segments carry `segment_kind`,
+  `merge_group_id`, `parent_merge_group_id`, `segment_idx`, `num_segments`, and
+  parent trainable-token counts so training and artifacts can reconstruct the
+  logical parent rollout.
+- **Packed-variable actor update**: the current long-run path uses the patched
+  padding-free actor update with row-order / row-pad compatibility.  Segment rows
+  are carried through `polar_packed_variable_train_payload` instead of forcing
+  every segment into the fixed prompt+response rectangle.
+
+The current true-long runbook uses these defaults:
+
+```bash
+# Prompt-grounded stitching.
+POLAR_STITCH_BY_MERGE_GROUP=1
+POLAR_PREFIX_MERGING_MODE=prompt_grounded_single
+
+# Stable packed update path: row-order / row-pad compatibility.
+POLAR_PACKED_VARIABLE_ENABLE=1
+POLAR_PACKED_VARIABLE_ACTOR_UPDATE=1
+POLAR_PACKED_VARIABLE_PARTITION_MODE=row_order
+POLAR_PACKED_VARIABLE_LEGACY_LOSS_SCALE=1
+POLAR_PACKED_VARIABLE_COMPACT_FIXED_OUTPUT=1
+POLAR_PACKED_VARIABLE_MINIBATCH_MODE=row_pad
+POLAR_PACKED_VARIABLE_ROW_PAD=1
+
+# Parent-aware subagent/wipe semantics.
+POLAR_SEGMENT_REWARD_MODE=none
+POLAR_PACKED_ADVANTAGE_LEVEL=parent
+POLAR_PACKED_PARENT_SAMPLE_LOSS=1
+POLAR_PACKED_SEGMENT_WEIGHT_LOSS=1
+
+# Subagent segments.
+POLAR_SEARCH_SUBAGENT_ENABLE=1
+POLAR_SEARCH_MAX_SUBAGENTS=1
+POLAR_SEARCH_SUBAGENT_MAX_TURNS=2
+POLAR_SEARCH_SUBAGENT_MAX_TOKENS=4096
+POLAR_SEARCH_SUBAGENT_REPORT_MAX_CHARS=4096
+POLAR_SEARCH_SUBAGENT_REPORT_FORMAT=sections
+POLAR_SEARCH_SUBAGENT_CONTEXT_MAX_CHARS=2048
+
+# Wipe / compaction segments.
+POLAR_SEARCH_WIPE_ENABLE=1
+POLAR_SEARCH_WIPE_MAX_TURNS=4
+POLAR_SEARCH_WIPE_CONTEXT_RATIO=0.50
+POLAR_SEARCH_COMPACTION_ENABLE=$POLAR_SEARCH_WIPE_ENABLE
+POLAR_SEARCH_COMPACTION_MAX_TURNS=$POLAR_SEARCH_WIPE_MAX_TURNS
+POLAR_SEARCH_COMPACTION_CONTEXT_RATIO=$POLAR_SEARCH_WIPE_CONTEXT_RATIO
+
+# Filtered human-readable interaction artifact.
+POLAR_SUBAGENT_WIPE_INTERACTION_ARTIFACT=1
+POLAR_SUBAGENT_WIPE_INTERACTION_FORMAT=html
+POLAR_SUBAGENT_WIPE_INTERACTION_TOOL_MAX_CHARS=20000
+```
+
+To recover the earlier fixed-DataProto baseline, disable packed actor update,
+subagent, and wipe explicitly:
+
+```bash
+POLAR_PACKED_VARIABLE_ACTOR_UPDATE=0
+POLAR_PACKED_VARIABLE_ENABLE=0
+POLAR_SEARCH_SUBAGENT_ENABLE=0
+POLAR_SEARCH_WIPE_ENABLE=0
+```
+
+---
+
 ## Current limitations
 
-This repo is phase 1: SearchR1 has been moved from standalone verl into the
-harness-driven architecture.  To support truly arbitrary search-agent harnesses,
-the following pieces still need to be generalized:
+This repo is still not the final arbitrary-harness interface.  The remaining work
+is now narrower:
 
-1. Explicit trace splitting when a harness resets, summarizes, compresses, or
-   branches context.
-2. Better support for variable batch size / variable fanout when different tasks
-   produce different numbers of trainable segments.
-3. A standard trace/reward schema across harnesses.
-4. Stronger train/inference consistency auditing for sampled assistant spans,
-   canonical context spans, truncation, masking, and reward assignment.
+1. Generalize segment markers into a stable harness-agnostic trace schema.
+2. Validate more reset/compression patterns beyond the current SearchR1 subagent
+   and wipe paths.
+3. Continue tightening train/inference consistency audits for sampled assistant
+   spans, canonical context spans, truncation, masking, and reward assignment.

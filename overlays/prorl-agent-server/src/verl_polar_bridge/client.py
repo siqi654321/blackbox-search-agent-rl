@@ -7,6 +7,8 @@ from typing import Any
 
 import httpx
 
+from polar.http_utils import polar_http_timeout
+
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -37,14 +39,14 @@ class PolarRolloutClient:
             f"{self.base_url}/rollout/task/submit",
             json=data,
             headers={"Content-Type": "application/json"},
-            timeout=self.timeout,
+            timeout=polar_http_timeout(self.timeout),
         )
         response.raise_for_status()
         body = response.json()
         return _parse_task_response(body)
 
     def get_task_status(self, task_id: str) -> "TaskStatus":
-        response = httpx.get(f"{self.base_url}/rollout/task/{task_id}", timeout=self.timeout)
+        response = httpx.get(f"{self.base_url}/rollout/task/{task_id}", timeout=polar_http_timeout(self.timeout))
         response.raise_for_status()
         return _parse_task_status(response.json())
 
@@ -80,13 +82,13 @@ class PolarGatewayClient:
         response = httpx.post(
             f"{self.gateway_url}/admin/sglang/pause",
             params=params,
-            timeout=request_timeout,
+            timeout=polar_http_timeout(request_timeout),
         )
         response.raise_for_status()
         return _safe_json(response)
 
     def resume_generation(self) -> dict[str, Any]:
-        response = httpx.post(f"{self.gateway_url}/admin/sglang/resume", timeout=self.timeout)
+        response = httpx.post(f"{self.gateway_url}/admin/sglang/resume", timeout=polar_http_timeout(self.timeout))
         response.raise_for_status()
         return _safe_json(response)
 
@@ -94,7 +96,7 @@ class PolarGatewayClient:
         response = httpx.post(
             f"{self.gateway_url}/admin/sglang/upstream",
             json={"base_url": base_url, "timeout_seconds": timeout_seconds},
-            timeout=max(float(timeout_seconds) + 5.0, float(self.timeout or 0), 10.0),
+            timeout=polar_http_timeout(max(float(timeout_seconds) + 5.0, float(self.timeout or 0), 10.0)),
         )
         response.raise_for_status()
         return _safe_json(response)

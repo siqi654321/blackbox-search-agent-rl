@@ -1,6 +1,6 @@
 """OpenAI-compatible bridge backed by VERL-managed SGLang /generate HTTP.
 
-This mirrors the prompt-grounded rollout path: tokenize/apply chat template locally, call the
+This mirrors The reference implementation's rollout path: tokenize/apply chat template locally, call the
 SGLang native /generate endpoint with input_ids, then convert SGLang's native
 output_token_logprobs into an OpenAI-like chat.completion response that carries
 input_token_ids/token_ids/logprobs for Polar trajectory building.
@@ -20,6 +20,7 @@ from uuid import uuid4
 
 import httpx
 import torch
+from polar.http_utils import polar_async_client, polar_http_timeout
 import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
@@ -353,12 +354,12 @@ def _build_app(*, sglang_base_urls: Sequence[str], tokenizer: Any, model_name: s
                 )
 
         headers = {"X-SMG-Routing-Key": session_key} if session_key else None
-        timeout = httpx.Timeout(float(os.environ.get("POLAR_SGLANG_GENERATE_TIMEOUT", "300")))
+        timeout = polar_http_timeout(float(os.environ.get("POLAR_SGLANG_GENERATE_TIMEOUT", "300")))
         upstream_url = _choose_upstream(session_key)
         _mark_upstream_start(upstream_url)
         upstream_t0 = time.perf_counter()
         try:
-            async with httpx.AsyncClient(timeout=timeout) as client:
+            async with polar_async_client(timeout=timeout) as client:
                 response = await client.post(f"{upstream_url}/generate", json=payload, headers=headers)
         except Exception:
             upstream_elapsed_s = time.perf_counter() - upstream_t0

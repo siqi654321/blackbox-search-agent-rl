@@ -111,8 +111,22 @@ def _artifact_metadata(runtime: dict[str, Any]) -> dict[str, Any]:
     if isinstance(transcript, list):
         assistant_turns = [item for item in transcript if isinstance(item, dict) and "assistant" in item]
         tool_turns = [item for item in transcript if isinstance(item, dict) and "tool" in item]
+        # Match VERL ToolAgentLoop code: ``num_turns`` is
+        # ``assistant_turns + user_turns + 1``.  The tool loop increments
+        # ``user_turns`` once per PROCESSING_TOOLS state after an assistant turn,
+        # even if that assistant emitted multiple tool calls / tool observation
+        # messages.  Keep a message-level variant for debugging, but expose
+        # ``driver_num_turns`` in the code-equivalent block-level form.
+        tool_blocks = [
+            item
+            for item in assistant_turns
+            if item.get("tool_calls") and not item.get("has_answer") and not item.get("budget_exhausted")
+        ]
         out["driver_turns"] = len(assistant_turns)
         out["driver_tool_turns"] = len(tool_turns)
+        out["driver_tool_blocks"] = len(tool_blocks)
+        out["driver_num_turns"] = len(assistant_turns) + len(tool_blocks) + 1
+        out["driver_num_turns_tool_messages"] = len(assistant_turns) + len(tool_turns) + 1
     if "response_budget_used" in data:
         try:
             out["driver_response_budget_used"] = float(data["response_budget_used"])
@@ -181,7 +195,8 @@ def _prediction_text_with_source(trajectory: Trajectory, runtime: dict[str, Any]
             except Exception:
                 pass
     texts: list[str] = []
-    for trace in trajectory.traces:
+    traces = _final_answer_traces(trajectory)
+    for trace in traces:
         for msg in trace.response_messages or []:
             content = msg.get("content") if isinstance(msg, dict) else None
             if content:
@@ -203,7 +218,7 @@ def _decode_truncated_response_text(trajectory: Trajectory) -> str:
         return ""
     max_tokens = _env_int("POLAR_SEARCH_REWARD_MAX_RESPONSE_TOKENS", _env_int("SEARCH_MAX_TOKENS", 2048))
     texts: list[str] = []
-    for trace in trajectory.traces or []:
+    for trace in _final_answer_traces(trajectory):
         ids = list(getattr(trace, "response_ids", []) or [])
         if not ids:
             continue
@@ -212,6 +227,32 @@ def _decode_truncated_response_text(trajectory: Trajectory) -> str:
         except Exception:
             continue
     return "\n".join(text for text in texts if text)
+
+
+def _final_answer_traces(trajectory: Trajectory) -> list[Any]:
+    traces = list(trajectory.traces or [])
+    final: list[Any] = []
+    main_wipe: list[tuple[int, int, Any]] = []
+    for trace in traces:
+        metadata = getattr(trace, "metadata", {}) or {}
+        if not isinstance(metadata, dict):
+            continue
+        kind = metadata.get("segment_kind") or metadata.get("segment_type")
+        normalized_kind = str(kind or "").strip().lower()
+        if bool(metadata.get("is_final_segment")) or normalized_kind in {"final", "main"}:
+            final.append(trace)
+        elif normalized_kind == "wipe":
+            try:
+                merge_group_index = int(metadata.get("merge_group_index") or 0)
+            except (TypeError, ValueError):
+                merge_group_index = 0
+            main_wipe.append((merge_group_index, len(main_wipe), trace))
+    if final:
+        return final
+    if main_wipe:
+        max_index = max(item[0] for item in main_wipe)
+        return [trace for index, _, trace in main_wipe if index == max_index]
+    return final or traces
 
 
 def _reward_tokenizer() -> Any:
@@ -259,7 +300,7 @@ def _debug_reward(payload: dict[str, Any]) -> None:
     print("POLAR_SEARCH_REWARD_DEBUG " + json.dumps(payload, ensure_ascii=False), file=sys.stderr, flush=True)
 
 
-# The functions below mirror the SearchR1 QA exact-match scorer,
+# The functions below mirror the SearchR1-style QA exact-match reward implementation,
 # which compare_standalone_vs_polar.sh copies into VERL for the standalone run.
 
 def normalize_answer(s: Any) -> str:
