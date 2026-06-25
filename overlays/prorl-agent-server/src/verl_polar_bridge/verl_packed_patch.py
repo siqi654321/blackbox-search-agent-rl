@@ -99,6 +99,7 @@ def packed_variable_actor_update(trainer: Any, payload: dict[str, Any]) -> Any:
             pad_parent_sample_groups_to_divisor,
             parent_sample_loss_denominators,
             packed_actor_data_metrics,
+            packed_actor_logprob_parity_metrics,
             packed_training_payload_metrics,
             packed_variable_payload_to_actor_samples,
             partition_actor_samples_equal_count_by_tokens,
@@ -362,6 +363,16 @@ def packed_variable_actor_update(trainer: Any, payload: dict[str, Any]) -> Any:
         metrics[f"{prefix}/old_log_prob_recomputed"] = 1.0
         metrics[f"{prefix}/old_log_prob_tokens"] = float(old_logprob_tokens)
         metrics[f"{prefix}/timing_s/old_log_prob"] = float(time.perf_counter() - old_log_prob_t0)
+        parity_metrics = []
+        for shard_samples_for_metrics, old_output in zip(update_shard_samples, old_log_prob_outputs, strict=True):
+            parity_metrics.append(
+                packed_actor_logprob_parity_metrics(
+                    shard_samples_for_metrics,
+                    old_output["log_probs"],
+                    prefix=prefix,
+                )
+            )
+        metrics.update(_reduce_metric_dicts(parity_metrics))
 
         if use_kl_loss:
             ref_log_prob_t0 = time.perf_counter()

@@ -466,7 +466,7 @@ grep -RInE 'training/global_step|polar/fanout_training|polar/trace|rollout_corr|
 For packed subagent/wipe runs, also check the parent-aware packed metrics:
 
 ```bash
-grep -RInE 'polar/packed_variable_update/(parent_advantage_level|parent_sample_loss_enabled|parent_aware_minibatch|num_parent_samples|num_fanout_parent_samples|parent_rows_before_pad|parent_rows_after_pad|parent_minibatch_row_pad|updated|valid)' \
+grep -RInE 'polar/packed_variable_update/(parent_advantage_level|parent_sample_loss_enabled|parent_aware_minibatch|num_parent_samples|num_fanout_parent_samples|parent_rows_before_pad|parent_rows_after_pad|parent_minibatch_row_pad|packed_parent/|packed_grpo/|rollout_corr/(final|subagent|wipe|row_pad)|updated|valid)' \
   "$LOG_DIR" /tmp/ray/session_latest/logs/worker-*.out 2>/dev/null | tail -50
 ```
 
@@ -686,6 +686,17 @@ sample.  With the current defaults:
   the parent contributes approximately one sample worth of loss instead of three.
 - `POLAR_PACKED_SEGMENT_WEIGHT_LOSS=1` is ignored while parent-sample loss is
   enabled to avoid double scaling by both `1/k` and the parent token denominator.
+- The packed path now emits guardrail metrics under `packed_parent/*` and
+  `packed_grpo/*`.  In a healthy parent-aware run, parent loss-weight sums should
+  stay close to 1, parent advantage mismatch should stay 0, and GRPO group sizes
+  should reflect rollout fanout rather than segment-row fanout.
+- Actor/rollout logprob parity is also broken down by segment kind and by
+  near-start / middle / near-end token buckets.  This makes it easier to spot
+  whether drift is concentrated in `subagent`, `wipe`, or `final` segments.
+- Adapter-side legacy canonical-tail stitching is automatically skipped for
+  `prefix_merging_prompt_grounded_single` traces, and can be disabled explicitly
+  with `POLAR_DISABLE_ADAPTER_LEGACY_STITCH=1`.  This prevents the older fallback
+  stitcher from re-stitching already prompt-grounded segments.
 
 A concrete subagent + wipe episode is now visible in the HTML artifact.  For
 example, one audited run asks which of John Barrasso, Nancy Pelosi, Mark Amodei,
