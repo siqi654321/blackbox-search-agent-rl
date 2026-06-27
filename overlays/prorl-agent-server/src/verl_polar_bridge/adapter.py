@@ -89,13 +89,7 @@ def session_result_to_verl_samples(
         if isinstance(getattr(result, "metadata", None), dict)
         else None
     )
-    stitch_guard_reason = _adapter_legacy_stitch_guard_reason(traces)
-    legacy_stitch_enabled = (
-        stitch_traces
-        and not _disable_adapter_legacy_stitch()
-        and stitch_guard_reason is None
-    )
-    if legacy_stitch_enabled:
+    if stitch_traces:
         if _env_flag("POLAR_STITCH_BY_MERGE_GROUP", default=False):
             grouped_traces = _try_stitch_trace_groups(
                 traces,
@@ -120,11 +114,7 @@ def session_result_to_verl_samples(
                     if sample is not None:
                         grouped_samples.append(sample)
                 if grouped_samples:
-                    return _annotate_segment_samples(
-                        grouped_samples,
-                        adapter_legacy_stitch_enabled=True,
-                        adapter_legacy_stitch_disabled_reason=None,
-                    )
+                    return _annotate_segment_samples(grouped_samples)
 
         merged_trace = _try_stitch_traces(
             traces,
@@ -145,11 +135,7 @@ def session_result_to_verl_samples(
                 overflow_policy=overflow_policy,
             )
             if sample is not None:
-                return _annotate_segment_samples(
-                    [sample],
-                    adapter_legacy_stitch_enabled=True,
-                    adapter_legacy_stitch_disabled_reason=None,
-                )
+                return _annotate_segment_samples([sample])
     samples: list[VerlPolarSample] = []
     for trace_index, trace in enumerate(traces):
         sample = _build_sample(
@@ -167,18 +153,7 @@ def session_result_to_verl_samples(
             samples.append(sample)
 
     if samples:
-        disabled_reason = (
-            "env"
-            if _disable_adapter_legacy_stitch()
-            else stitch_guard_reason
-            if stitch_guard_reason is not None
-            else None
-        )
-        return _annotate_segment_samples(
-            samples,
-            adapter_legacy_stitch_enabled=bool(legacy_stitch_enabled),
-            adapter_legacy_stitch_disabled_reason=disabled_reason,
-        )
+        return _annotate_segment_samples(samples)
 
     logger.warning(
         "Session %s: no usable trace (traces=%d, max_tokens=%s); emitting placeholder",
@@ -195,57 +170,6 @@ def session_result_to_verl_samples(
             reward_key=reward_key,
         )
     ]
-
-
-def _disable_adapter_legacy_stitch() -> bool:
-    """Disable adapter-side legacy Trace stitching.
-
-    The trajectory builder can already emit prompt-grounded traces and explicit
-    subagent/wipe segments.  In that mode, adapter-side legacy canonical-tail
-    stitching may reintroduce prompt-prefix drift after the builder has produced
-    aligned traces.  Keep this opt-in so older fallback paths retain their
-    historical behavior.
-    """
-
-    return _env_flag("POLAR_DISABLE_ADAPTER_LEGACY_STITCH", default=False)
-
-
-def _adapter_legacy_stitch_guard_reason(traces: list[Any]) -> str | None:
-    """Return a reason to skip adapter-side legacy stitching for canonical traces.
-
-    ``prefix_merging_prompt_grounded_single`` and explicit Search segment fanout
-    already carry prompt-grounded token streams.  Re-running the older adapter
-    canonical-tail stitcher on those rows can reintroduce prompt drift, so make
-    the protection data-driven rather than relying only on a launch env var.
-    """
-
-    has_prompt_grounded_single = False
-    has_explicit_fanout = False
-    for trace in traces:
-        metadata = getattr(trace, "metadata", {}) or {}
-        if not isinstance(metadata, dict):
-            continue
-        builder = str(metadata.get("builder") or "").strip()
-        if builder == "prefix_merging_prompt_grounded_single" or bool(
-            metadata.get("prompt_grounded_single_merge_enabled")
-        ):
-            has_prompt_grounded_single = True
-        parent_group = metadata.get("parent_merge_group_id")
-        segment_group = metadata.get("segment_group_id") or metadata.get("merge_group_id")
-        if parent_group is not None and segment_group is not None and str(parent_group) != str(segment_group):
-            has_explicit_fanout = True
-            continue
-        try:
-            if parent_group is not None and int(metadata.get("merge_group_index") or 0) > 0:
-                has_explicit_fanout = True
-        except (TypeError, ValueError):
-            pass
-    if has_prompt_grounded_single:
-        return "builder_prompt_grounded_single"
-    if has_explicit_fanout and _env_flag("POLAR_DISABLE_ADAPTER_LEGACY_STITCH_FOR_SEGMENTS", default=False):
-        return "explicit_segment_fanout"
-    return None
-
 
 def task_result_to_verl_samples(
     task_result: Any,
@@ -321,12 +245,7 @@ def _try_stitch_trace_groups(
     return merged
 
 
-def _annotate_segment_samples(
-    samples: list[VerlPolarSample],
-    *,
-    adapter_legacy_stitch_enabled: bool | None = None,
-    adapter_legacy_stitch_disabled_reason: str | None = None,
-) -> list[VerlPolarSample]:
+def _annotate_segment_samples(samples: list[VerlPolarSample]) -> list[VerlPolarSample]:
     if not samples:
         return samples
     k = len(samples)
@@ -338,10 +257,6 @@ def _annotate_segment_samples(
         polar = sample.metadata.setdefault("polar", {})
         if not isinstance(polar, dict):
             sample.metadata["polar"] = polar = {}
-        if adapter_legacy_stitch_enabled is not None:
-            polar["adapter_legacy_stitch_enabled"] = bool(adapter_legacy_stitch_enabled)
-        if adapter_legacy_stitch_disabled_reason:
-            polar["adapter_legacy_stitch_disabled_reason"] = str(adapter_legacy_stitch_disabled_reason)
         kind = str(polar.get("segment_kind") or "").strip().lower()
         try:
             merge_group_index = int(polar.get("merge_group_index") or 0)
@@ -1111,18 +1026,6 @@ def _segment_metadata(trace: "Trace") -> dict[str, Any]:
         "segment_index",
         "harness_event",
         "harness_mode",
-        "compaction_enabled",
-        "is_after_wipe",
-        "wipe_index",
-        "last_wipe_turn",
-        "last_wipe_reasons",
-        "last_wipe_prompt_tokens",
-        "last_wipe_context_ratio",
-        "last_wipe_message_count_before",
-        "last_wipe_message_count_after",
-        "last_wipe_dropped_message_count",
-        "last_wipe_preserve_tail_messages",
-        "last_wipe_apply_point",
     ):
         if key in trace_meta:
             out[key] = deepcopy(trace_meta[key])

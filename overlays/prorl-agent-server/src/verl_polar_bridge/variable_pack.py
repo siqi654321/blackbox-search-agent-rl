@@ -180,9 +180,7 @@ def _sample_to_record(sample_index: int, sample: VerlPolarSample) -> dict[str, A
         or f"{_source_uid(sample)}:0"
     )
     segment_kind = polar.get("segment_kind") or trace_meta.get("segment_kind") or trace_meta.get("segment_type")
-    source_uid = _source_uid(sample)
-    rollout_uid = _sample_uid(sample, source_uid)
-    group_uid = _grpo_group_uid(sample, rollout_uid)
+    group_uid = _sample_uid(sample, _source_uid(sample))
     input_ids = prompt_ids + response_ids
     loss_mask_full = [0] * len(prompt_ids) + response_mask
     rollout_log_probs_full = [0.0] * len(prompt_ids) + rollout_log_probs
@@ -195,11 +193,10 @@ def _sample_to_record(sample_index: int, sample: VerlPolarSample) -> dict[str, A
     parent_sample_uid = polar.get("parent_sample_uid") or polar.get("session_id") or f"{group_uid}:trajectory:{sample.trajectory_index}"
     return {
         "sample_index": int(sample_index),
-        "sample_uid": str(rollout_uid),
-        "source_uid": source_uid,
+        "sample_uid": str(group_uid),
+        "source_uid": _source_uid(sample),
         "parent_sample_uid": str(parent_sample_uid),
         "group_uid": str(group_uid),
-        "rollout_uid": str(rollout_uid),
         "segment_group_id": str(segment_group_id),
         "segment_kind": None if segment_kind is None else str(segment_kind),
         "segment_weight": float(segment_weight),
@@ -260,15 +257,6 @@ def _sample_uid(sample: VerlPolarSample, source_uid: str) -> str:
         if value is not None:
             return str(value)
     return str(source_uid)
-
-
-def _grpo_group_uid(sample: VerlPolarSample, rollout_uid: str) -> str:
-    polar = sample.metadata.get("polar", {}) if isinstance(sample.metadata, dict) else {}
-    if isinstance(polar, dict):
-        value = polar.get("grpo_group_uid")
-        if value is not None:
-            return str(value)
-    return str(rollout_uid)
 
 
 def _source_uid(sample: VerlPolarSample) -> str:

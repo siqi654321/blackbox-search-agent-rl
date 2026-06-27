@@ -18,7 +18,6 @@ class PackedActorSample:
     sample_index: int
     sample_uid: str
     group_uid: str
-    rollout_uid: str
     source_uid: str
     parent_sample_uid: str
     segment_group_id: str
@@ -68,7 +67,6 @@ def packed_variable_payload_to_actor_samples(payload: dict[str, Any]) -> list[Pa
                 sample_index=int(record.get("sample_index", idx)),
                 sample_uid=str(record.get("sample_uid", idx)),
                 group_uid=str(record.get("group_uid", record.get("sample_uid", idx))),
-                rollout_uid=str(record.get("rollout_uid", record.get("sample_uid", idx))),
                 source_uid=str(record.get("source_uid", record.get("sample_uid", idx))),
                 parent_sample_uid=str(
                     record.get(
@@ -338,7 +336,6 @@ def _zero_loss_padding_sample(source: PackedActorSample, sample_index: int) -> P
         source,
         sample_index=int(sample_index),
         sample_uid=f"{source.sample_uid}::__row_pad_{abs(sample_index)}",
-        rollout_uid=f"{source.rollout_uid}::__row_pad_{abs(sample_index)}",
         source_uid=f"{source.source_uid}::__row_pad_{abs(sample_index)}",
         parent_sample_uid=f"{source.parent_sample_uid}::__row_pad_{abs(sample_index)}",
         segment_group_id=f"{source.segment_group_id}::__row_pad_{abs(sample_index)}",
@@ -575,37 +572,10 @@ def packed_training_payload_metrics(
     from collections import defaultdict
 
     parent_segment_ids: dict[str, set[str]] = defaultdict(set)
-    parent_samples: dict[str, list[PackedActorSample]] = defaultdict(list)
-    grpo_group_sizes: dict[str, set[str]] = defaultdict(set)
     for sample in samples:
         parent_segment_ids[str(sample.parent_sample_uid)].add(str(sample.segment_group_id))
-        if not sample.parent_slot_padding:
-            parent_samples[str(sample.parent_sample_uid)].append(sample)
-            grpo_group_sizes[str(sample.group_uid)].add(str(sample.parent_sample_uid))
     fanout_parent_count = sum(1 for segment_ids in parent_segment_ids.values() if len(segment_ids) > 1)
-
-    loss_weight_sums: list[float] = []
-    fanout_counts: list[float] = []
-    parent_trainable_sums: list[float] = []
-    parent_declared_denoms: list[float] = []
-    advantage_unique_counts: list[float] = []
-    group_uid_unique_counts: list[float] = []
-    for group in parent_samples.values():
-        if not group:
-            continue
-        declared = max(1, max(int(sample.parent_sample_trainable_tokens or 0) for sample in group))
-        actual = sum(int(sample.trainable_tokens or 0) for sample in group)
-        loss_weight_sums.append(float(actual) / float(declared))
-        fanout_counts.append(float(len({str(sample.segment_group_id) for sample in group})))
-        parent_trainable_sums.append(float(actual))
-        parent_declared_denoms.append(float(declared))
-        advantage_unique_counts.append(
-            float(len({round(float(advantages_by_sample.get(sample.sample_index, 0.0)), 12) for sample in group}))
-        )
-        group_uid_unique_counts.append(float(len({str(sample.group_uid) for sample in group})))
-    group_sizes = [float(len(values)) for values in grpo_group_sizes.values()]
-
-    out = {
+    return {
         f"{prefix}/num_samples": float(len(samples)),
         f"{prefix}/num_groups": float(group_count),
         f"{prefix}/num_segment_groups": float(segment_group_count),
@@ -616,31 +586,7 @@ def packed_training_payload_metrics(
         f"{prefix}/advantage_mean": float(sum(advantages) / max(len(advantages), 1)),
         f"{prefix}/advantage_abs_mean": float(sum(abs(v) for v in advantages) / max(len(advantages), 1)),
         f"{prefix}/segment_weight_mean": float(sum(sample.segment_weight for sample in samples) / max(len(samples), 1)),
-        f"{prefix}/packed_parent/fanout_count_mean": _mean(fanout_counts),
-        f"{prefix}/packed_parent/fanout_count_max": max(fanout_counts, default=0.0),
-        f"{prefix}/packed_parent/trainable_tokens_sum_mean": _mean(parent_trainable_sums),
-        f"{prefix}/packed_parent/trainable_tokens_sum_max": max(parent_trainable_sums, default=0.0),
-        f"{prefix}/packed_parent/declared_loss_denom_mean": _mean(parent_declared_denoms),
-        f"{prefix}/packed_parent/loss_weight_sum_mean": _mean(loss_weight_sums),
-        f"{prefix}/packed_parent/loss_weight_sum_min": min(loss_weight_sums, default=0.0),
-        f"{prefix}/packed_parent/loss_weight_sum_max": max(loss_weight_sums, default=0.0),
-        f"{prefix}/packed_parent/loss_weight_bad_count": float(
-            sum(1 for value in loss_weight_sums if abs(value - 1.0) > 1e-3)
-        ),
-        f"{prefix}/packed_parent/advantage_unique_count_max": max(advantage_unique_counts, default=0.0),
-        f"{prefix}/packed_parent/advantage_mismatch_count": float(
-            sum(1 for value in advantage_unique_counts if value > 1.0)
-        ),
-        f"{prefix}/packed_parent/group_uid_unique_count_max": max(group_uid_unique_counts, default=0.0),
-        f"{prefix}/packed_parent/group_uid_mismatch_count": float(
-            sum(1 for value in group_uid_unique_counts if value > 1.0)
-        ),
-        f"{prefix}/packed_grpo/group_size_mean": _mean(group_sizes),
-        f"{prefix}/packed_grpo/group_size_min": min(group_sizes, default=0.0),
-        f"{prefix}/packed_grpo/group_size_max": max(group_sizes, default=0.0),
-        f"{prefix}/packed_grpo/singleton_group_count": float(sum(1 for value in group_sizes if value <= 1.0)),
     }
-    return out
 
 
 def packed_actor_data_metrics(
@@ -803,7 +749,7 @@ def packed_actor_logprob_parity_metrics(
     else:
         corr_value = 1.0
     ratio = torch.exp(diff).clamp(min=1e-30, max=1e30)
-    out = {
+    return {
         f"{prefix}/valid": 1.0,
         f"{prefix}/tokens": float(actor.numel()),
         f"{prefix}/logprob_abs_diff_mean": float(diff.abs().mean().detach().item()),
@@ -812,69 +758,6 @@ def packed_actor_logprob_parity_metrics(
         f"{prefix}/rollout_corr/k3_kl": float(((ratio - 1.0) - torch.log(ratio)).mean().detach().item()),
         f"{prefix}/rollout_corr/chi2_token": float(((ratio - 1.0) ** 2).mean().detach().item()),
     }
-    out.update(_segment_logprob_breakdown(samples, rows, prefix=prefix))
-    return out
-
-
-def _segment_logprob_breakdown(samples: list[PackedActorSample], rows: list[Any], *, prefix: str) -> dict[str, float]:
-    import torch
-
-    grouped: dict[str, list[torch.Tensor]] = {}
-    for sample, row in zip(samples, rows, strict=True):
-        row = row.detach().to(torch.float32)
-        mask = torch.tensor(sample.loss_mask_full, dtype=torch.bool, device=row.device)
-        if int(row.numel()) <= 1 or int(mask.sum().item()) <= 0:
-            continue
-        actor = row[:-1][mask[1:]]
-        rollout = torch.tensor(sample.rollout_log_probs_full, dtype=torch.float32, device=row.device)[1:][mask[1:]]
-        if int(actor.numel()) <= 0:
-            continue
-        diff = actor - rollout
-        kind = _normalized_segment_kind(sample)
-        grouped.setdefault(kind, []).append(diff)
-        trainable_positions = [idx for idx, value in enumerate(sample.loss_mask_full) if int(value)]
-        if len(trainable_positions) == int(diff.numel()):
-            pos_tensor = torch.tensor(trainable_positions, dtype=torch.long, device=diff.device)
-            first = int(trainable_positions[0])
-            last = int(trainable_positions[-1])
-            buckets = {
-                "near_start": pos_tensor < first + 64,
-                "near_end": (last - pos_tensor) < 64,
-            }
-            middle = ~(buckets["near_start"] | buckets["near_end"])
-            buckets["middle"] = middle
-            for bucket, bucket_mask in buckets.items():
-                if bool(bucket_mask.any().item()):
-                    grouped.setdefault(f"{kind}/{bucket}", []).append(diff[bucket_mask])
-    return _ratio_breakdown_metrics(grouped, prefix=prefix)
-
-
-def _ratio_breakdown_metrics(grouped: dict[str, list[Any]], *, prefix: str) -> dict[str, float]:
-    import torch
-
-    out: dict[str, float] = {}
-    for key, chunks in grouped.items():
-        if not chunks:
-            continue
-        diff = torch.cat(chunks)
-        ratio = torch.exp(diff).clamp(min=1e-30, max=1e30)
-        out[f"{prefix}/rollout_corr/{key}/tokens"] = float(diff.numel())
-        out[f"{prefix}/rollout_corr/{key}/k3_kl"] = float(((ratio - 1.0) - torch.log(ratio)).mean().detach().item())
-        out[f"{prefix}/rollout_corr/{key}/chi2_token"] = float(((ratio - 1.0) ** 2).mean().detach().item())
-        out[f"{prefix}/rollout_corr/{key}/ratio_fraction_high"] = float(
-            (ratio > 2.0).to(torch.float32).mean().detach().item()
-        )
-        out[f"{prefix}/rollout_corr/{key}/ratio_fraction_low"] = float(
-            (ratio < 0.5).to(torch.float32).mean().detach().item()
-        )
-    return out
-
-
-def _normalized_segment_kind(sample: PackedActorSample) -> str:
-    kind = str(sample.segment_kind or "unknown").strip().lower() or "unknown"
-    if kind not in {"final", "subagent", "wipe", "main", "row_pad"}:
-        kind = "other"
-    return kind
 
 
 def apply_smoke_reward_diversity(

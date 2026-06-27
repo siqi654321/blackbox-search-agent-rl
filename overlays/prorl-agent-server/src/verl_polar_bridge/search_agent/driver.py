@@ -90,7 +90,6 @@ def main() -> None:
     )
     current_merge_group_index = 0
     num_merge_groups_estimate = 1
-    last_wipe_metadata: dict[str, Any] | None = None
     deferred_wipe_reasons: list[str] = []
     deferred_wipe_prompt_tokens: int | None = None
     subagent_enabled = _env_flag("POLAR_SEARCH_SUBAGENT_ENABLE", default=False)
@@ -233,9 +232,6 @@ def main() -> None:
                 "harness_mode": "searchr1",
                 "harness_event": "main_turn",
                 "turn": turn,
-                "compaction_enabled": bool(compaction_enabled),
-                "is_after_wipe": bool(last_wipe_metadata),
-                **(last_wipe_metadata or {}),
             },
             bridge_schedule_max_tokens=bridge_side_scheduling and budget_mode != "prompt_delta" and per_turn_max_tokens is None,
             prompt_length=args.prompt_length,
@@ -349,7 +345,7 @@ def main() -> None:
             if _safe_to_compact_messages(messages):
                 if deferred_wipe_reasons:
                     _timing_inc(timing, "wipe_deferred_applied_count")
-                messages, current_merge_group_index, num_merge_groups_estimate, last_wipe_metadata = _apply_wipe_compaction(
+                messages, current_merge_group_index, num_merge_groups_estimate = _apply_wipe_compaction(
                     messages,
                     timing=timing,
                     transcript=transcript,
@@ -1205,24 +1201,12 @@ def _apply_wipe_compaction(
     debug_enabled: bool,
     preserve_tail_messages: int = 0,
     apply_point: str = "after_tools",
-) -> tuple[list[dict[str, Any]], int, int, dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], int, int]:
     message_count_before = len(messages)
     messages = _compact_messages(messages, preserve_tail_messages=preserve_tail_messages)
     message_count_after = len(messages)
     current_merge_group_index += 1
     num_merge_groups_estimate = max(num_merge_groups_estimate, current_merge_group_index + 1)
-    wipe_metadata = {
-        "wipe_index": int(current_merge_group_index),
-        "last_wipe_turn": int(turn),
-        "last_wipe_reasons": list(reasons),
-        "last_wipe_prompt_tokens": prompt_tokens,
-        "last_wipe_context_ratio": float(context_ratio),
-        "last_wipe_message_count_before": int(message_count_before),
-        "last_wipe_message_count_after": int(message_count_after),
-        "last_wipe_dropped_message_count": max(0, int(message_count_before) - int(message_count_after)),
-        "last_wipe_preserve_tail_messages": int(preserve_tail_messages),
-        "last_wipe_apply_point": str(apply_point),
-    }
     _timing_inc(timing, "wipe_count")
     if apply_point == "before_tools":
         _timing_inc(timing, "wipe_before_tools_count")
@@ -1265,7 +1249,7 @@ def _apply_wipe_compaction(
                 "apply_point": str(apply_point),
             }
         )
-    return messages, current_merge_group_index, num_merge_groups_estimate, wipe_metadata
+    return messages, current_merge_group_index, num_merge_groups_estimate
 
 
 def _compact_messages(messages: list[dict[str, Any]], *, preserve_tail_messages: int = 0) -> list[dict[str, Any]]:
