@@ -72,6 +72,7 @@ def polar_extra_metrics(samples: list[VerlPolarSample], rewards: list[float] | N
     prompt_grounded_single_truncated_tokens_sum = 0.0
     prompt_grounded_single_partial_masked_tokens_sum = 0.0
     prompt_grounded_single_context_tail_tokens_sum = 0.0
+    prompt_grounded_single_segment_grouped_sessions = 0
 
     for sample in samples:
         polar_meta = sample.metadata.get("polar", {}) if isinstance(sample.metadata, dict) else {}
@@ -123,6 +124,8 @@ def polar_extra_metrics(samples: list[VerlPolarSample], rewards: list[float] | N
                     builder_prefix_split_sessions += 1
             elif builder == "prefix_merging_prompt_grounded_single":
                 builder_prefix_prompt_grounded_single_sessions += 1
+                if trajectory_meta.get("prompt_grounded_single_segment_grouping"):
+                    prompt_grounded_single_segment_grouped_sessions += 1
                 stats = trajectory_meta.get("reconstruction_stats") or {}
                 trace_count = int(trajectory_meta.get("trace_count") or 0)
                 completions_total = int(stats.get("completions_total") or 0) if isinstance(stats, dict) else 0
@@ -222,6 +225,7 @@ def polar_extra_metrics(samples: list[VerlPolarSample], rewards: list[float] | N
     out["polar/trace/prompt_grounded_single_truncated_tokens_sum"] = float(prompt_grounded_single_truncated_tokens_sum)
     out["polar/trace/prompt_grounded_single_partial_masked_tokens_sum"] = float(prompt_grounded_single_partial_masked_tokens_sum)
     out["polar/trace/prompt_grounded_single_context_tail_tokens_sum"] = float(prompt_grounded_single_context_tail_tokens_sum)
+    out["polar/trace/prompt_grounded_single_segment_grouped_sessions"] = float(prompt_grounded_single_segment_grouped_sessions)
     if resolved_values:
         out["polar/eval/resolved_rate"] = mean(resolved_values)
     if sent_max_tokens:

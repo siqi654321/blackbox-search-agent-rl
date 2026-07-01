@@ -34,9 +34,9 @@ examples, invariants, and edge cases.
 
 from __future__ import annotations
 
-import logging
 import os
-from collections import defaultdict, deque
+import logging
+from collections import OrderedDict, defaultdict, deque
 from copy import deepcopy
 from typing import Any
 
@@ -70,6 +70,21 @@ def _prompt_grounded_single_merge_enabled() -> bool:
     if mode in {"prompt_grounded", "prompt_grounded_single", "prompt-grounded", "prompt-grounded-single"}:
         return True
     return os.environ.get("POLAR_PROMPT_GROUNDED_SINGLE_MERGE", "0").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _prompt_grounded_single_segment_grouping_enabled() -> bool:
+    raw = os.environ.get("POLAR_PROMPT_GROUNDED_SINGLE_SEGMENT_GROUPING")
+    if raw is None:
+        return True
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _trace_merge_group_id(trace: Trace) -> str | None:
+    metadata = getattr(trace, "metadata", {}) or {}
+    if not isinstance(metadata, dict):
+        return None
+    value = metadata.get("merge_group_id") or metadata.get("segment_group_id")
+    return None if value is None else str(value)
 
 
 def _prompt_alignment_audit_all() -> bool:
@@ -354,6 +369,14 @@ class PrefixMergingBuilder(BaseTrajectoryBuilder):
                 error="no completions" if raw_completion_count == 0 else "no non-internal completions",
             )
 
+        if _prompt_grounded_single_merge_enabled() and _prompt_grounded_single_segment_grouping_enabled():
+            return self._build_prompt_grounded_single_grouped_trajectory(
+                session,
+                completions,
+                raw_completion_count=raw_completion_count,
+                skipped_internal_count=skipped_internal_count,
+            )
+
         chains: list[list[CompletionRecord]] = []
         waiting_chains: dict[str, deque[int]] = defaultdict(deque)
 
@@ -426,6 +449,104 @@ class PrefixMergingBuilder(BaseTrajectoryBuilder):
                 "task_metadata": dict(session.metadata),
                 "trace_count": len(chains),
                 "reconstruction_stats": stats,
+                **_top_level_scheduler_metadata(session.metadata),
+            },
+            traces=final_traces,
+        )
+
+    def _build_prompt_grounded_single_grouped_trajectory(
+        self,
+        session: CompletionSession,
+        completions: list[CompletionRecord],
+        *,
+        raw_completion_count: int,
+        skipped_internal_count: int,
+    ) -> Trajectory:
+        """Build one prompt-grounded trace per explicit segment/merge group.
+
+        The legacy prefix-merging chain assignment is deliberately strict: a
+        later completion may join a chain only when its prompt is an append-only
+        token prefix of the previous prompt.  That is useful for the legacy
+        canonical-tail stitcher, but it prevents prompt-grounded recovery from
+        seeing the cases it is designed to handle, such as prompt drift,
+        wipe/compact boundaries, or Search subagent interleaving.
+
+        In prompt-grounded-single mode, the harness-provided ``merge_group_id``
+        is the hard segment boundary.  Within each group, prompts are reconciled
+        by ``_finalize_chain_prompt_grounded_single`` using the actual rollout
+        prompt for every completion.  This makes the Polar builder itself emit:
+
+        * one main trace for normal SearchR1;
+        * one trace per main wipe segment when wipe is enabled;
+        * one trace per independent subagent segment when subagent is enabled.
+
+        Adapter-side token stitch should therefore be unnecessary for
+        ``prefix_merging_prompt_grounded_single`` trajectories.
+        """
+
+        grouped: "OrderedDict[str, list[CompletionRecord]]" = OrderedDict()
+        explicit_group_count = 0
+        for idx, completion in enumerate(completions):
+            trace = build_trace_from_completion(completion)
+            group_id = _trace_merge_group_id(trace)
+            if group_id is None:
+                group_id = "__default__"
+            else:
+                explicit_group_count += 1
+            grouped.setdefault(str(group_id), []).append(completion)
+            _prefix_debug(
+                "prompt_grounded_single_group_assign",
+                {
+                    "session_id": session.session_id,
+                    "completion": _completion_debug_summary(completion, trace),
+                    "group_id": group_id,
+                    "completion_index": idx,
+                    "explicit_group": group_id != "__default__",
+                },
+            )
+
+        stats: dict[str, int] = {
+            "chains_total": len(grouped),
+            "chains_reconstructed_full": 0,
+            "chains_reconstructed_truncated": 0,
+            "completions_total": len(completions),
+            "completions_total_raw": raw_completion_count,
+            "completions_skipped_internal": skipped_internal_count,
+            "completions_merged": 0,
+            "prompt_grounded_single_segment_grouping": 1,
+            "prompt_grounded_single_explicit_group_count": explicit_group_count,
+        }
+        final_traces = [self._finalize_chain_prompt_grounded_single(chain, stats) for chain in grouped.values()]
+        _prefix_debug(
+            "prompt_grounded_single_grouped_build_final",
+            {
+                "session_id": session.session_id,
+                "group_ids": list(grouped.keys()),
+                "group_lengths": [len(chain) for chain in grouped.values()],
+                "stats": dict(stats),
+                "trace_prompt_lens": [len(trace.prompt_ids) for trace in final_traces],
+                "trace_response_lens": [len(trace.response_ids) for trace in final_traces],
+                "trace_loss_tokens": [sum(int(v) for v in (trace.loss_mask or [])) for trace in final_traces],
+            },
+        )
+
+        return Trajectory(
+            status="COMPLETED",
+            metadata={
+                "builder": "prefix_merging_prompt_grounded_single",
+                "session_id": session.session_id,
+                "task_id": session.task_id,
+                "api_type": session.api_type,
+                "model_requested": session.model_requested,
+                "model_used": session.model_used,
+                "record_count": len(completions),
+                "record_count_raw": raw_completion_count,
+                "record_count_skipped_internal": skipped_internal_count,
+                "task_metadata": dict(session.metadata),
+                "trace_count": len(final_traces),
+                "reconstruction_stats": stats,
+                "prompt_grounded_single_segment_grouping": 1,
+                "prompt_grounded_single_group_ids": list(grouped.keys()),
                 **_top_level_scheduler_metadata(session.metadata),
             },
             traces=final_traces,

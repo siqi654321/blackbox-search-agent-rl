@@ -298,10 +298,12 @@ def resolve_polar_verl_config(config: Any) -> PolarVerlConfig:
     if metrics_longest_trace_interval <= 0:
         raise ValueError("polar.metrics.longest_trace_interval must be greater than 0")
 
-    # Default remains baseline-compatible stitching: append-only Search traces are
-    # merged into one VERL row when safe. Complex/Prompt-grounded all-trace runs can
-    # disable this so every builder trace becomes its own trainable segment.
-    stitch_traces = bool(_get_any(polar, ("training.stitch_traces", "stitch_traces"), default=True))
+    # Adapter-side stitching is a legacy fallback for non-prompt-grounded
+    # builders.  The prompt_grounded_single builder now emits one already-merged
+    # trace per logical merge_group/segment, so it is safe (and preferred) for
+    # the adapter to pass builder traces through unchanged.  Keep this switch for
+    # compatibility with older prefix_merging/per_request paths.
+    stitch_traces = bool(_get_any(polar, ("training.stitch_traces", "stitch_traces"), default=False))
 
     return PolarVerlConfig(
         rollout_server_url=str(rollout_server_url).rstrip("/"),

@@ -73,6 +73,38 @@ def test_adapter_group_stitch_splits_subagent_and_final(monkeypatch):
     assert {s.metadata["polar"]["num_segments"] for s in samples} == {2}
 
 
+def test_adapter_does_not_stitch_prompt_grounded_single_builder_traces(monkeypatch):
+    monkeypatch.setenv("POLAR_STITCH_BY_MERGE_GROUP", "1")
+    monkeypatch.setenv("POLAR_SEGMENT_REWARD_MODE", "none")
+    # These two traces have the same merge group and are stitchable by the
+    # legacy adapter.  For prefix_merging_prompt_grounded_single, however,
+    # builder output is authoritative and the adapter must pass traces through
+    # unchanged.
+    final0 = _trace("sid:main", "final", [1, 2], [10])
+    final1 = _trace("sid:main", "final", [1, 2, 10, 90], [11])
+    result = SimpleNamespace(
+        trajectory=SimpleNamespace(
+            traces=[final0, final1],
+            metadata={"source_uid": "row-1", "builder": "prefix_merging_prompt_grounded_single"},
+            status="COMPLETED",
+            error=None,
+        ),
+        metadata={"source_uid": "row-1"},
+        node_id="node",
+        error=None,
+        session_id="sid",
+        status="COMPLETED",
+        task_id="task",
+        timing=_Timing(),
+    )
+
+    samples = session_result_to_verl_samples(result, group_index=0, trajectory_index=0, uid="row-1")
+
+    assert len(samples) == 2
+    assert [s.response_ids for s in samples] == [[10], [11]]
+    assert all("adapter_stitched_trace_count" not in s.metadata["polar"]["trace_metadata"] for s in samples)
+
+
 def test_full_trajectory_payload_groups_subagent_with_parent(monkeypatch):
     monkeypatch.setenv("POLAR_STITCH_BY_MERGE_GROUP", "1")
     monkeypatch.setenv("POLAR_SEGMENT_REWARD_MODE", "prompt_grounded_split")

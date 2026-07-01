@@ -74,14 +74,15 @@ def session_result_to_verl_samples(
 ) -> list[VerlPolarSample]:
     """Convert one Polar session result into VERL samples.
 
-    Prefer one stitched full-trajectory sample per session.  SearchR1/VERL's
-    native ToolAgentLoop returns ``initial_prompt + (assistant/tool)*`` as one
-    training row: sampled assistant tokens have loss_mask=1 and tool / template
-    interstitial tokens have loss_mask=0.  If Polar's generic prefix_merging
-    builder failed to merge a Search trajectory into one trace, we do a guarded
-    token-only stitch here using the next turn's canonical ``prompt_ids`` tail.
-    This never decodes/re-encodes text and falls back to per-trace samples if
-    token-prefix invariants do not hold.
+    For ``prefix_merging_prompt_grounded_single`` trajectories, the Polar
+    builder is the single source of truth for token-level merging.  The adapter
+    must not stitch again: doing so hides builder bugs and can merge across
+    segment boundaries.  With SearchR1 subagent/wipe, the builder emits one
+    already-merged trace per ``merge_group_id``/segment, and this adapter only
+    converts those traces to VERL rows plus segment metadata.
+
+    The legacy adapter stitch remains available for non-prompt-grounded builders
+    as a compatibility fallback.
     """
     traces = list(result.trajectory.traces)
     source_uid = (
@@ -89,7 +90,7 @@ def session_result_to_verl_samples(
         if isinstance(getattr(result, "metadata", None), dict)
         else None
     )
-    if stitch_traces:
+    if stitch_traces and not _trajectory_is_prompt_grounded_single(result):
         if _env_flag("POLAR_STITCH_BY_MERGE_GROUP", default=False):
             grouped_traces = _try_stitch_trace_groups(
                 traces,
@@ -170,6 +171,19 @@ def session_result_to_verl_samples(
             reward_key=reward_key,
         )
     ]
+
+
+def _trajectory_is_prompt_grounded_single(result: Any) -> bool:
+    trajectory = getattr(result, "trajectory", None)
+    metadata = getattr(trajectory, "metadata", {}) if trajectory is not None else {}
+    if isinstance(metadata, dict) and metadata.get("builder") == "prefix_merging_prompt_grounded_single":
+        return True
+    for trace in list(getattr(trajectory, "traces", []) or []):
+        trace_meta = getattr(trace, "metadata", {}) or {}
+        if isinstance(trace_meta, dict) and trace_meta.get("builder") == "prefix_merging_prompt_grounded_single":
+            return True
+    return False
+
 
 def task_result_to_verl_samples(
     task_result: Any,

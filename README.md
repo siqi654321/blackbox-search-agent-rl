@@ -374,11 +374,14 @@ export POLAR_OVERFLOW_POLICY=verl_truncate
 # True-long prompt-grounded stitching.
 export POLAR_DYNAMIC_HISTORY_ENABLE=true
 export POLAR_DYNAMIC_HISTORY_MODE=trace
-export POLAR_STITCH_TRACES=true
-export POLAR_STITCH_BY_MERGE_GROUP=1
+export POLAR_STITCH_TRACES=false
+# prompt_grounded_single now merges inside PrefixMergingBuilder by segment/merge group.
+# Keep the legacy adapter stitch disabled for the current long-run path.
+# export POLAR_STITCH_BY_MERGE_GROUP=1
 export POLAR_REJECT_LOGPROB_ERROR=true
 export POLAR_SEARCH_BRIDGE_MAX_TOKENS=true
 export POLAR_PREFIX_MERGING_MODE=prompt_grounded_single
+export POLAR_PROMPT_GROUNDED_SINGLE_SEGMENT_GROUPING=1
 
 # Current long-run path: packed actor update with row-order / row-pad
 # compatibility, not the variable-row minibatch path.
@@ -580,8 +583,8 @@ The current merge mode is:
 POLAR_PREFIX_MERGING_MODE=prompt_grounded_single
 ```
 
-The implementation is inspired by the trajectory merging approach used in slime,
-but the code and public configuration here use the neutral “prompt-grounded” name.
+This mode avoids decode/re-encode drift by grounding context spans in the actual
+rollout prompts and uses the neutral “prompt-grounded” public configuration name.
 
 Each model call records a completion trace:
 
@@ -662,6 +665,11 @@ agent-like harnesses:
   `merge_group_id`, `parent_merge_group_id`, `segment_idx`, `num_segments`, and
   parent trainable-token counts so training and artifacts can reconstruct the
   logical parent rollout.
+- **Builder-side prompt-grounded merging**: `prompt_grounded_single` now groups
+  completions by `merge_group_id` / `segment_group_id` inside
+  `PrefixMergingBuilder` and emits one already-merged trace per logical segment.
+  The adapter therefore treats builder output as authoritative and does not run
+  the older token-stitch fallback for this path.
 - **Packed-variable actor update**: the current long-run path uses the patched
   padding-free actor update with row-order / row-pad compatibility.  Segment rows
   are carried through `polar_packed_variable_train_payload` instead of forcing
@@ -698,9 +706,12 @@ rollout rather than one forced append-only row.
 The current true-long runbook uses these defaults:
 
 ```bash
-# Prompt-grounded stitching.
-POLAR_STITCH_BY_MERGE_GROUP=1
+# Prompt-grounded stitching happens in PrefixMergingBuilder by segment/merge group.
 POLAR_PREFIX_MERGING_MODE=prompt_grounded_single
+POLAR_PROMPT_GROUNDED_SINGLE_SEGMENT_GROUPING=1
+POLAR_STITCH_TRACES=false
+# Optional legacy adapter fallback for non-prompt-grounded builders only:
+# POLAR_STITCH_BY_MERGE_GROUP=1
 
 # Stable packed update path: row-order / row-pad compatibility.
 POLAR_PACKED_VARIABLE_ENABLE=1

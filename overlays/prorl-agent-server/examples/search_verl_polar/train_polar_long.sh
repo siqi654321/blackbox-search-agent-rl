@@ -56,8 +56,11 @@ export POLAR_FANOUT_TRAINING="${POLAR_FANOUT_TRAINING:-1}"
 # Current true-long defaults: prompt-grounded merge + subagent/wipe segmentation
 # + parent-aware packed actor update.  Override these envs to recover the fixed
 # DataProto baseline.
-export POLAR_STITCH_BY_MERGE_GROUP="${POLAR_STITCH_BY_MERGE_GROUP:-1}"
 export POLAR_PREFIX_MERGING_MODE="${POLAR_PREFIX_MERGING_MODE:-prompt_grounded_single}"
+export POLAR_PROMPT_GROUNDED_SINGLE_SEGMENT_GROUPING="${POLAR_PROMPT_GROUNDED_SINGLE_SEGMENT_GROUPING:-1}"
+export POLAR_STITCH_TRACES="${POLAR_STITCH_TRACES:-false}"
+# Legacy adapter stitch fallback for non-prompt-grounded builders only.
+export POLAR_STITCH_BY_MERGE_GROUP="${POLAR_STITCH_BY_MERGE_GROUP:-0}"
 
 export POLAR_PACKED_VARIABLE_ENABLE="${POLAR_PACKED_VARIABLE_ENABLE:-1}"
 export POLAR_PACKED_VARIABLE_ACTOR_UPDATE="${POLAR_PACKED_VARIABLE_ACTOR_UPDATE:-1}"
@@ -217,7 +220,7 @@ CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-4,5,6,7}" python3 -m verl.trainer.
   +polar.acceptance.reject_logprob_error="${POLAR_REJECT_LOGPROB_ERROR:-true}" \
   +polar.metrics.log_longest_trace_artifact="${POLAR_LOG_LONGEST_TRACE_ARTIFACT:-true}" \
   +polar.metrics.longest_trace_interval="${POLAR_LONGEST_TRACE_INTERVAL:-1}" \
-  +polar.training.stitch_traces="${POLAR_STITCH_TRACES:-true}"
+  +polar.training.stitch_traces="${POLAR_STITCH_TRACES:-false}"
 
 if [[ "${POLAR_SLEEP_INFINITY:-0}" == "1" ]]; then
   sleep infinity
